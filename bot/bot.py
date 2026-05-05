@@ -177,18 +177,34 @@ def folder_name(path: str) -> str:
     return (path or "").split("\\")[-1] or "<root>"
 
 
-def result_label(result: dict[str, Any]) -> str:
-    return trim(f"{folder_name(result.get('folder', ''))} — {result.get('user', 'unknown')} ({result.get('match_count', 0)})", 100)
+def folder_parts(path: str) -> list[str]:
+    return [part for part in str(path or "").split("\\") if part]
+
+
+def artist_album_text(result: dict[str, Any]) -> str:
+    artist = str(result.get("artist") or "").strip()
+    album = str(result.get("album") or folder_name(result.get("folder", ""))).strip() or "<root>"
+    if artist and artist.lower() != album.lower():
+        return f"{artist} — {album}"
+    return album
+
+
+def result_label(result: dict[str, Any], index: int | None = None) -> str:
+    prefix = f"{index}. " if index is not None else ""
+    return trim(f"{prefix}{artist_album_text(result)}", 100)
 
 
 def result_desc(result: dict[str, Any]) -> str:
-    samples = result.get("sample_files") or []
-    parts = []
-    if samples:
-        parts.append(", ".join(samples[:2]))
-    if result.get("size_human"):
-        parts.append(str(result["size_human"]))
+    parts = [f"{result.get('match_count', 0)} files"]
+    format_summary = str(result.get("format_summary") or "").strip()
+    if format_summary:
+        parts.append(format_summary)
     return trim(" • ".join(parts), 100)
+
+
+def download_file_label(path: str) -> str:
+    parts = folder_parts(path)
+    return trim(parts[-1] if parts else (path or "file"), 120)
 
 
 def track_label(item: dict[str, Any]) -> str:
@@ -245,7 +261,7 @@ class SearchResultSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=result_label(result), description=result_desc(result) or None, value=str(index))
+                discord.SelectOption(label=result_label(result, index + 1), description=result_desc(result) or None, value=str(index))
                 for index, result in enumerate(results)
             ],
         )
@@ -281,7 +297,7 @@ class SearchResultsView(discord.ui.View):
         files = browse.get("files") or []
         self.session.update({"browse_request_id": request_id, "browse": browse, "folder": browse.get("folder", ""), "files": files})
         text = (
-            f"Selected `{result['user']}` → `{browse.get('folder') or '<root>'}`\n"
+            f"Selected `{artist_album_text(result)}`\n"
             f"Matched files: {result.get('match_count', 0)}\n"
             f"Folder tracks found: {len(files)}"
         )
@@ -418,10 +434,7 @@ async def slsk_album(interaction: discord.Interaction, query: str):
         return
     lines = [f"Top {len(results)} results for `{query}`:"]
     for index, result in enumerate(results, start=1):
-        sample = trim(", ".join(result.get("sample_files") or []), 90)
-        line = f"{index}. {trim(result.get('user'), 40)} :: {trim(result.get('folder') or '<root>', 80)} ({result.get('match_count', 0)} files, {result.get('size_human')})"
-        if sample:
-            line += f" — {sample}"
+        line = f"{index}. {result_label(result)} ({result.get('match_count', 0)} files, {result.get('format_summary', 'unknown format')})"
         lines.append(line)
     lines.append(f"Use the dropdown to choose the folder / album you want. (limit: {RESULTS_LIMIT})")
     await safe_edit(
@@ -481,14 +494,16 @@ async def watch_bridge_events():
         if not request_id or request_id not in state.pending:
             continue
         pending = state.pending[request_id]
+        path_label = download_file_label(str(event.get("path") or ""))
         message = None
         if kind == "started":
-            message = f"Download started: `{pending.query}`"
+            message = f"Download started: `{path_label}`"
         elif kind == "finished":
+            message = f"Download finished: `{path_label}`"
             state.pending.pop(request_id, None)
             state.save()
         elif kind == "error":
-            message = f"Error on `{pending.query}`: {event.get('error', 'unknown error')}"
+            message = f"Error downloading `{path_label}`: {event.get('error', 'unknown error')}"
             state.pending.pop(request_id, None)
             state.save()
         if message:

@@ -217,6 +217,38 @@ class Plugin(BasePlugin):
         pages = getattr(ui, "pages", None)
         return pages.get(user) if pages else None
 
+    def _split_virtual_path(self, value: str) -> list[str]:
+        return [part for part in str(value or "").split("\\") if part]
+
+    def _artist_album_from_folder(self, folder: str) -> tuple[str, str]:
+        parts = self._split_virtual_path(folder)
+        album = parts[-1] if parts else "<root>"
+        artist = parts[-2] if len(parts) >= 2 else ""
+        return artist, album
+
+    @staticmethod
+    def _file_extension(filename: str) -> str:
+        name = str(filename or "")
+        if "." not in name:
+            return ""
+        return name.rsplit(".", 1)[-1].strip().lower()
+
+    @staticmethod
+    def _format_label(ext: str) -> str:
+        return ext.upper() if ext else "unknown"
+
+    def _format_summary(self, counts: dict[str, int], total: int) -> str:
+        if not counts:
+            return "unknown format"
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        top_ext, top_count = ranked[0]
+        top_label = self._format_label(top_ext)
+        if len(ranked) == 1:
+            return top_label
+        if top_count >= max(1, int(total * 0.6)):
+            return f"mostly {top_label}"
+        return " / ".join(self._format_label(ext) for ext, _count in ranked[:2])
+
     def _summarize_search_rows(self, rows) -> list[dict]:
         groups = {}
         for row in rows or []:
@@ -230,18 +262,31 @@ class Plugin(BasePlugin):
                 continue
             folder, _, filename = fullpath.rpartition("\\")
             filename = filename or fullpath
+            artist, album = self._artist_album_from_folder(folder)
             item = groups.setdefault(
                 (user, folder),
-                {"user": user, "folder": folder, "match_count": 0, "size_bytes": 0, "sample_files": []},
+                {
+                    "user": user,
+                    "folder": folder,
+                    "artist": artist,
+                    "album": album,
+                    "match_count": 0,
+                    "size_bytes": 0,
+                    "sample_files": [],
+                    "format_counts": {},
+                },
             )
             item["match_count"] += 1
             item["size_bytes"] += size
+            ext = self._file_extension(filename)
+            item["format_counts"][ext] = item["format_counts"].get(ext, 0) + 1
             if len(item["sample_files"]) < 3:
                 item["sample_files"].append(filename)
         results = list(groups.values())
         results.sort(key=lambda item: (-item["match_count"], -item["size_bytes"], item["folder"].lower(), item["user"].lower()))
         for item in results:
             item["size_human"] = self._human_size(item["size_bytes"])
+            item["format_summary"] = self._format_summary(item.pop("format_counts", {}), item["match_count"])
         return results[: self._results_limit()]
 
     def _iter_share_files(self, shares, folder: str = "", recursive: bool = False):
