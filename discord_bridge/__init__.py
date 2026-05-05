@@ -90,10 +90,12 @@ class Plugin(BasePlugin):
         ]
         self._stop = threading.Event()
         self._server_thread = None
+        self._progress_thread = None
         self._server_socket = None
         self._lock = threading.RLock()
         self._pending = defaultdict(deque)
         self._active = {}
+        self._progress_marks = {}
         self._search_sessions = {}
         self._browse_sessions = {}
 
@@ -105,6 +107,7 @@ class Plugin(BasePlugin):
         self._load_state()
         self._write_runtime_manifest()
         self._start_server()
+        self._start_progress_watcher()
         self.log(f"Discord bridge ready at {self.socket_path} (events={self.events_path})")
 
     def disable(self):
@@ -443,6 +446,54 @@ class Plugin(BasePlugin):
         self._server_thread = threading.Thread(target=self._serve, name="DiscordBridgeSocket", daemon=True)
         self._server_thread.start()
 
+    def _start_progress_watcher(self):
+        if self._progress_thread and self._progress_thread.is_alive():
+            return
+        self._progress_thread = threading.Thread(target=self._watch_download_progress, name="DiscordBridgeProgress", daemon=True)
+        self._progress_thread.start()
+
+    def _watch_download_progress(self):
+        while not self._stop.wait(2.0):
+            try:
+                self._poll_download_progress()
+            except Exception:
+                continue
+
+    def _poll_download_progress(self):
+        transfers = getattr(getattr(self.core, "transfers", None), "downloads", None) or []
+        for download in list(transfers):
+            if str(getattr(download, "status", "") or "") != "Transferring":
+                continue
+            user = str(getattr(download, "user", "") or "")
+            virtual_path = str(getattr(download, "filename", "") or "")
+            if not user or not virtual_path:
+                continue
+            request_id = self._claim_request_id(user, virtual_path, finish=False)
+            if not request_id:
+                continue
+            size = self._safe_int(getattr(download, "size", 0), 0)
+            current = self._safe_int(getattr(download, "current_byte_offset", 0), 0)
+            if size <= 0 or current <= 0:
+                continue
+            percent = max(0, min(99, int((current * 100) / size)))
+            marks = self._progress_marks.setdefault(request_id, set())
+            newly_reached = [threshold for threshold in (25, 50, 75) if percent >= threshold and threshold not in marks]
+            if not newly_reached:
+                continue
+            highest = max(newly_reached)
+            for threshold in (25, 50, 75):
+                if threshold <= highest:
+                    marks.add(threshold)
+            self._append_event({
+                "event": "progress",
+                "request_id": request_id,
+                "user": user,
+                "path": virtual_path,
+                "percent": highest,
+                "current_bytes": current,
+                "total_bytes": size,
+            })
+
     def _serve(self):
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server_socket = server
@@ -604,11 +655,14 @@ class Plugin(BasePlugin):
             return request_id
 
     def download_started_notification(self, user, virtual_path, real_path):
+        request_id = self._claim_request_id(user, virtual_path, finish=False)
+        if request_id:
+            self._progress_marks.pop(request_id, None)
         if not self.settings.get("emit_download_started", True):
             return
         self._append_event({
             "event": "started",
-            "request_id": self._claim_request_id(user, virtual_path, finish=False),
+            "request_id": request_id,
             "user": user,
             "path": virtual_path,
             "real_path": real_path,
@@ -618,6 +672,8 @@ class Plugin(BasePlugin):
         request_id = self._claim_request_id(user, virtual_path, finish=True)
         if request_id is None:
             request_id = self._claim_request_id(user, virtual_path, finish=False)
+        if request_id:
+            self._progress_marks.pop(request_id, None)
         if not self.settings.get("emit_download_finished", True):
             return
         self._append_event({
