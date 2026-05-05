@@ -1,0 +1,4 @@
+Version = "0.2.1"
+Authors = ["taxonbooger"]
+Name = "Discord Bridge"
+Description = "Nicotine+ plugin for Discord album search, folder browse, exact download queueing, and upload-start alerts via the companion Discord bot."
