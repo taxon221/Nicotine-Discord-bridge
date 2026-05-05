@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -12,6 +13,17 @@ from pathlib import Path
 
 from gi.repository import GLib
 from pynicotine.pluginsystem import BasePlugin
+
+
+AUDIO_EXTENSIONS = {
+    "aac", "aif", "aiff", "alac", "ape", "dsf", "flac", "m4a", "m4b", "mid", "midi",
+    "mp2", "mp3", "mpc", "ogg", "oga", "opus", "ra", "tak", "tta", "wav", "wma", "wv",
+}
+GENERIC_FOLDER_NAMES = {
+    "albums", "album", "audio", "complete", "completed", "discography", "downloads", "flac",
+    "library", "lossless", "lossy", "media", "mixes", "mp3", "music", "new", "release", "releases",
+    "rips", "shared", "soulseek", "unsorted", "various artists", "va", "web",
+}
 
 
 class Plugin(BasePlugin):
@@ -30,6 +42,8 @@ class Plugin(BasePlugin):
             "emit_upload_finished": False,
             "emit_download_started": True,
             "emit_download_finished": True,
+            "upload_alert_mode": "file",
+            "download_alert_mode": "file",
             "bot_env_path": str(Path.home() / "nicotine-discord-bridge" / ".env"),
         }
         self.metasettings = {
@@ -60,6 +74,14 @@ class Plugin(BasePlugin):
             "emit_download_finished": {
                 "description": "Write download-finished events",
                 "type": "bool",
+            },
+            "upload_alert_mode": {
+                "description": "Discord alert granularity for uploads: file or album",
+                "type": "string",
+            },
+            "download_alert_mode": {
+                "description": "Discord alert granularity for downloads: file or album",
+                "type": "string",
             },
         }
         self.__privatecommands__ = [
@@ -115,6 +137,16 @@ class Plugin(BasePlugin):
             value = str(Path.home() / "nicotine-discord-bridge" / ".env")
         return Path(value).expanduser()
 
+    def _alert_mode(self, key: str, default: str = "file") -> str:
+        value = str(self.settings.get(key) or default).strip().lower()
+        return value if value in {"file", "album"} else default
+
+    def _download_alert_mode(self) -> str:
+        return self._alert_mode("download_alert_mode", "file")
+
+    def _upload_alert_mode(self) -> str:
+        return self._alert_mode("upload_alert_mode", "file")
+
     def _runtime_manifest(self) -> dict:
         return {
             "data_dir": str(self.base_dir),
@@ -128,6 +160,8 @@ class Plugin(BasePlugin):
             "emit_upload_finished": bool(self.settings.get("emit_upload_finished", False)),
             "emit_download_started": bool(self.settings.get("emit_download_started", True)),
             "emit_download_finished": bool(self.settings.get("emit_download_finished", True)),
+            "upload_alert_mode": self._upload_alert_mode(),
+            "download_alert_mode": self._download_alert_mode(),
         }
 
     def _write_runtime_manifest(self):
@@ -220,10 +254,46 @@ class Plugin(BasePlugin):
     def _split_virtual_path(self, value: str) -> list[str]:
         return [part for part in str(value or "").split("\\") if part]
 
-    def _artist_album_from_folder(self, folder: str) -> tuple[str, str]:
+    @staticmethod
+    def _clean_name(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "").replace("_", " ")).strip(" -_[](){}")
+
+    def _looks_like_username(self, value: str, user: str = "") -> bool:
+        name = self._clean_name(value)
+        lowered = name.lower()
+        user_lower = str(user or "").strip().lower()
+        if not name:
+            return True
+        if user_lower and lowered == user_lower:
+            return True
+        if lowered in GENERIC_FOLDER_NAMES:
+            return True
+        if re.fullmatch(r"(?i)(disc|disk|cd)\s*\d+", lowered):
+            return True
+        compact = name.replace(" ", "")
+        if re.fullmatch(r"[a-z0-9_.-]+", compact) and any(ch.isdigit() for ch in compact):
+            return True
+        return False
+
+    def _album_from_parts(self, parts: list[str]) -> tuple[str, list[str]]:
+        if not parts:
+            return "<root>", []
+        leaf = self._clean_name(parts[-1]) or "<root>"
+        if re.fullmatch(r"(?i)(disc|disk|cd)\s*\d+", leaf) and len(parts) >= 2:
+            return f"{self._clean_name(parts[-2])} [{leaf}]", parts[:-2]
+        return leaf, parts[:-1]
+
+    def _artist_album_from_folder(self, folder: str, user: str = "") -> tuple[str, str]:
         parts = self._split_virtual_path(folder)
-        album = parts[-1] if parts else "<root>"
-        artist = parts[-2] if len(parts) >= 2 else ""
+        album, prefix_parts = self._album_from_parts(parts)
+        match = re.match(r"(?P<artist>.+?)\s*[-–—]\s*(?P<album>.+)", album)
+        if match:
+            artist = self._clean_name(match.group("artist"))
+            parsed_album = self._clean_name(match.group("album"))
+            if artist and parsed_album:
+                return artist, parsed_album
+        candidates = [self._clean_name(part) for part in prefix_parts if not self._looks_like_username(part, user=user)]
+        artist = candidates[-1] if candidates else ""
         return artist, album
 
     @staticmethod
@@ -237,17 +307,12 @@ class Plugin(BasePlugin):
     def _format_label(ext: str) -> str:
         return ext.upper() if ext else "unknown"
 
-    def _format_summary(self, counts: dict[str, int], total: int) -> str:
+    def _format_summary(self, counts: dict[str, int]) -> str:
         if not counts:
-            return "unknown format"
+            return "unknown audio"
         ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        top_ext, top_count = ranked[0]
-        top_label = self._format_label(top_ext)
-        if len(ranked) == 1:
-            return top_label
-        if top_count >= max(1, int(total * 0.6)):
-            return f"mostly {top_label}"
-        return " / ".join(self._format_label(ext) for ext, _count in ranked[:2])
+        labels = [self._format_label(ext) for ext, _count in ranked[:2]]
+        return labels[0] if len(labels) == 1 else " + ".join(labels)
 
     def _summarize_search_rows(self, rows) -> list[dict]:
         groups = {}
@@ -262,7 +327,7 @@ class Plugin(BasePlugin):
                 continue
             folder, _, filename = fullpath.rpartition("\\")
             filename = filename or fullpath
-            artist, album = self._artist_album_from_folder(folder)
+            artist, album = self._artist_album_from_folder(folder, user=user)
             item = groups.setdefault(
                 (user, folder),
                 {
@@ -271,6 +336,7 @@ class Plugin(BasePlugin):
                     "artist": artist,
                     "album": album,
                     "match_count": 0,
+                    "audio_file_count": 0,
                     "size_bytes": 0,
                     "sample_files": [],
                     "format_counts": {},
@@ -279,14 +345,17 @@ class Plugin(BasePlugin):
             item["match_count"] += 1
             item["size_bytes"] += size
             ext = self._file_extension(filename)
-            item["format_counts"][ext] = item["format_counts"].get(ext, 0) + 1
+            if ext in AUDIO_EXTENSIONS:
+                item["audio_file_count"] += 1
+                item["format_counts"][ext] = item["format_counts"].get(ext, 0) + 1
             if len(item["sample_files"]) < 3:
                 item["sample_files"].append(filename)
         results = list(groups.values())
-        results.sort(key=lambda item: (-item["match_count"], -item["size_bytes"], item["folder"].lower(), item["user"].lower()))
+        results.sort(key=lambda item: (-item["audio_file_count"], -item["match_count"], -item["size_bytes"], item["folder"].lower(), item["user"].lower()))
         for item in results:
             item["size_human"] = self._human_size(item["size_bytes"])
-            item["format_summary"] = self._format_summary(item.pop("format_counts", {}), item["match_count"])
+            item["display_file_count"] = item["audio_file_count"] or item["match_count"]
+            item["format_summary"] = self._format_summary(item.pop("format_counts", {}))
         return results[: self._results_limit()]
 
     def _iter_share_files(self, shares, folder: str = "", recursive: bool = False):

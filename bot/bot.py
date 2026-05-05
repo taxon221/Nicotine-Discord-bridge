@@ -55,6 +55,8 @@ EVENTS_FILE = Path(os.environ.get("NICOTINE_BRIDGE_EVENTS") or RUNTIME.get("even
 STATE_FILE = Path(os.environ.get("NICOTINE_BRIDGE_STATE") or (Path(RUNTIME.get("data_dir") or DEFAULT_BRIDGE_DIR) / "bot-state.json")).expanduser()
 RESULTS_LIMIT = max(1, min(25, int(RUNTIME.get("results_limit", 5) or 5)))
 TRACK_PICKER_LIMIT = max(1, min(25, int(RUNTIME.get("track_picker_limit", 25) or 25)))
+DOWNLOAD_ALERT_MODE = str(RUNTIME.get("download_alert_mode", "file") or "file").strip().lower()
+UPLOAD_ALERT_MODE = str(RUNTIME.get("upload_alert_mode", "file") or "file").strip().lower()
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
 ALERT_CHANNEL_ID = os.environ.get("DISCORD_ALERT_CHANNEL_ID", "").strip()
@@ -189,13 +191,17 @@ def artist_album_text(result: dict[str, Any]) -> str:
     return album
 
 
+def result_file_count(result: dict[str, Any]) -> int:
+    return int(result.get("display_file_count") or result.get("audio_file_count") or result.get("match_count") or 0)
+
+
 def result_label(result: dict[str, Any], index: int | None = None) -> str:
     prefix = f"{index}. " if index is not None else ""
     return trim(f"{prefix}{artist_album_text(result)}", 100)
 
 
 def result_desc(result: dict[str, Any]) -> str:
-    parts = [f"{result.get('match_count', 0)} files"]
+    parts = [f"{result_file_count(result)} files"]
     format_summary = str(result.get("format_summary") or "").strip()
     if format_summary:
         parts.append(format_summary)
@@ -205,6 +211,22 @@ def result_desc(result: dict[str, Any]) -> str:
 def download_file_label(path: str) -> str:
     parts = folder_parts(path)
     return trim(parts[-1] if parts else (path or "file"), 120)
+
+
+def download_album_label(path: str) -> str:
+    parts = folder_parts(path)
+    if len(parts) >= 2:
+        album = parts[-2]
+        if len(parts) >= 3:
+            artist = parts[-3]
+            if artist and artist.lower() != album.lower():
+                return trim(f"{artist} — {album}", 120)
+        return trim(album, 120)
+    return download_file_label(path)
+
+
+def alert_path_label(path: str, mode: str) -> str:
+    return download_album_label(path) if mode == "album" else download_file_label(path)
 
 
 def track_label(item: dict[str, Any]) -> str:
@@ -298,7 +320,7 @@ class SearchResultsView(discord.ui.View):
         self.session.update({"browse_request_id": request_id, "browse": browse, "folder": browse.get("folder", ""), "files": files})
         text = (
             f"Selected `{artist_album_text(result)}`\n"
-            f"Matched files: {result.get('match_count', 0)}\n"
+            f"Matched audio files: {result_file_count(result)}\n"
             f"Folder tracks found: {len(files)}"
         )
         if len(files) > TRACK_PICKER_LIMIT:
@@ -434,7 +456,7 @@ async def slsk_album(interaction: discord.Interaction, query: str):
         return
     lines = [f"Top {len(results)} results for `{query}`:"]
     for index, result in enumerate(results, start=1):
-        line = f"{index}. {result_label(result)} ({result.get('match_count', 0)} files, {result.get('format_summary', 'unknown format')})"
+        line = f"{index}. {result_label(result)} ({result_file_count(result)} files, {result.get('format_summary', 'unknown audio')})"
         lines.append(line)
     lines.append(f"Use the dropdown to choose the folder / album you want. (limit: {RESULTS_LIMIT})")
     await safe_edit(
@@ -489,12 +511,21 @@ async def watch_bridge_events():
             if channel is not None:
                 user = event.get("user", "unknown")
                 path = event.get("path", "")
-                await send_message(channel.id, f"Someone started downloading from you: `{user}` -> `{path}`")
+                label = alert_path_label(str(path or ""), UPLOAD_ALERT_MODE)
+                await send_message(channel.id, f"Someone started downloading from you: `{user}` -> `{label}`")
+            continue
+        if kind == "upload_finished":
+            channel = await resolve_alert_channel()
+            if channel is not None:
+                user = event.get("user", "unknown")
+                path = event.get("path", "")
+                label = alert_path_label(str(path or ""), UPLOAD_ALERT_MODE)
+                await send_message(channel.id, f"Someone finished downloading from you: `{user}` -> `{label}`")
             continue
         if not request_id or request_id not in state.pending:
             continue
         pending = state.pending[request_id]
-        path_label = download_file_label(str(event.get("path") or ""))
+        path_label = alert_path_label(str(event.get("path") or ""), DOWNLOAD_ALERT_MODE)
         message = None
         if kind == "started":
             message = f"Download started: `{path_label}`"
