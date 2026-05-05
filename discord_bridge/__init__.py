@@ -22,7 +22,7 @@ AUDIO_EXTENSIONS = {
 GENERIC_FOLDER_NAMES = {
     "albums", "album", "audio", "complete", "completed", "discography", "downloads", "flac",
     "library", "lossless", "lossy", "media", "mixes", "mp3", "music", "new", "release", "releases",
-    "rips", "shared", "soulseek", "unsorted", "various artists", "va", "web",
+    "rips", "shared", "share", "shares", "shared files", "soulseek", "unsorted", "various artists", "va", "web",
 }
 
 
@@ -265,16 +265,20 @@ class Plugin(BasePlugin):
         name = self._clean_name(value)
         lowered = name.lower()
         user_lower = str(user or "").strip().lower()
+        compact = re.sub(r"[^a-z0-9]+", "", lowered)
         if not name:
             return True
-        if user_lower and lowered == user_lower:
+        if user_lower and (lowered == user_lower or compact == re.sub(r"[^a-z0-9]+", "", user_lower)):
             return True
         if lowered in GENERIC_FOLDER_NAMES:
             return True
+        if any(token in lowered for token in ("shared by", "user ", " user's", "files of", "upload from")):
+            return True
         if re.fullmatch(r"(?i)(disc|disk|cd)\s*\d+", lowered):
             return True
-        compact = name.replace(" ", "")
-        if re.fullmatch(r"[a-z0-9_.-]+", compact) and any(ch.isdigit() for ch in compact):
+        if re.search(r"\d{3,}", compact):
+            return True
+        if re.fullmatch(r"[a-z0-9_.-]+", compact) and len(compact) >= 8 and lowered == compact:
             return True
         return False
 
@@ -421,10 +425,14 @@ class Plugin(BasePlugin):
         self._append_event({"event": "queued", "request_id": request_id, "user": user, "path": virtual_path, "dest": dest})
         return request_id
 
+    def _queue_entry(self, user: str, virtual_path: str, dest: str = "", request_id: str | None = None) -> dict:
+        request_id = self._queue_file(user, virtual_path, dest=dest, request_id=request_id)
+        return {"request_id": request_id, "user": user, "path": virtual_path, "dest": dest}
+
     def _queue_folder(self, user: str, folder: str, shares, dest: str = "") -> list[dict]:
         queued = []
         for item in self._iter_share_files(shares, folder=folder, recursive=True):
-            queued.append({"request_id": self._queue_file(user, item["fullpath"], dest=dest), "path": item["fullpath"]})
+            queued.append(self._queue_entry(user, item["fullpath"], dest=dest))
         return queued
 
     def _resolve_files_by_names(self, shares, folder: str, names) -> list[dict]:
@@ -462,8 +470,6 @@ class Plugin(BasePlugin):
     def _poll_download_progress(self):
         transfers = getattr(getattr(self.core, "transfers", None), "downloads", None) or []
         for download in list(transfers):
-            if str(getattr(download, "status", "") or "") != "Transferring":
-                continue
             user = str(getattr(download, "user", "") or "")
             virtual_path = str(getattr(download, "filename", "") or "")
             if not user or not virtual_path:
@@ -471,28 +477,44 @@ class Plugin(BasePlugin):
             request_id = self._claim_request_id(user, virtual_path, finish=False)
             if not request_id:
                 continue
-            size = self._safe_int(getattr(download, "size", 0), 0)
-            current = self._safe_int(getattr(download, "current_byte_offset", 0), 0)
-            if size <= 0 or current <= 0:
+            status = str(getattr(download, "status", "") or "")
+            if status == "Transferring":
+                size = self._safe_int(getattr(download, "size", 0), 0)
+                current = self._safe_int(getattr(download, "current_byte_offset", 0), 0)
+                if size <= 0 or current <= 0:
+                    continue
+                percent = max(0, min(99, int((current * 100) / size)))
+                marks = self._progress_marks.setdefault(request_id, set())
+                newly_reached = [threshold for threshold in (25, 50, 75) if percent >= threshold and threshold not in marks]
+                if not newly_reached:
+                    continue
+                highest = max(newly_reached)
+                for threshold in (25, 50, 75):
+                    if threshold <= highest:
+                        marks.add(threshold)
+                self._append_event({
+                    "event": "progress",
+                    "request_id": request_id,
+                    "user": user,
+                    "path": virtual_path,
+                    "percent": highest,
+                    "current_bytes": current,
+                    "total_bytes": size,
+                })
                 continue
-            percent = max(0, min(99, int((current * 100) / size)))
-            marks = self._progress_marks.setdefault(request_id, set())
-            newly_reached = [threshold for threshold in (25, 50, 75) if percent >= threshold and threshold not in marks]
-            if not newly_reached:
+            if status in {"Queued", "Getting status", "Paused", "Filtered", "Finished"}:
                 continue
-            highest = max(newly_reached)
-            for threshold in (25, 50, 75):
-                if threshold <= highest:
-                    marks.add(threshold)
+            if request_id in self._progress_marks and status in {"Cancelled"}:
+                continue
+            self._progress_marks.pop(request_id, None)
             self._append_event({
-                "event": "progress",
+                "event": "error",
                 "request_id": request_id,
                 "user": user,
                 "path": virtual_path,
-                "percent": highest,
-                "current_bytes": current,
-                "total_bytes": size,
+                "error": status or "download failed",
             })
+            self._claim_request_id(user, virtual_path, finish=True)
 
     def _serve(self):
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -603,25 +625,23 @@ class Plugin(BasePlugin):
             if not user or not path:
                 return {"ok": False, "error": "user and path are required"}
             request_id = self._queue_file(user, path, dest=dest)
-            return {"ok": True, "queued": 1, "request_ids": [request_id]}
+            return {"ok": True, "queued": 1, "request_ids": [request_id], "entries": [{"request_id": request_id, "user": user, "path": path, "dest": dest}]}
 
         if op == "download_folder":
             session, payload = self._resolve_browse_session(str(request.get("request_id") or "").strip())
             if not session or not payload.get("ready"):
                 return payload
             queued = self._queue_folder(session["user"], session["folder"], session["shares"], dest=str(request.get("dest") or "").strip())
-            return {"ok": True, "queued": len(queued), "request_ids": [item["request_id"] for item in queued]}
+            return {"ok": True, "queued": len(queued), "request_ids": [item["request_id"] for item in queued], "entries": queued}
 
         if op == "download_files":
             session, payload = self._resolve_browse_session(str(request.get("request_id") or "").strip())
             if not session or not payload.get("ready"):
                 return payload
             resolved = self._resolve_files_by_names(session["shares"], session["folder"], request.get("files") or [])
-            queued = [
-                {"request_id": self._queue_file(session["user"], item["fullpath"], dest=str(request.get("dest") or "").strip()), "path": item["fullpath"]}
-                for item in resolved
-            ]
-            return {"ok": True, "queued": len(queued), "request_ids": [item["request_id"] for item in queued], "files": resolved}
+            dest = str(request.get("dest") or "").strip()
+            queued = [self._queue_entry(session["user"], item["fullpath"], dest=dest) for item in resolved]
+            return {"ok": True, "queued": len(queued), "request_ids": [item["request_id"] for item in queued], "entries": queued, "files": resolved}
 
         return {"ok": False, "error": f"unknown op: {op or '<empty>'}"}
 

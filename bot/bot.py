@@ -72,6 +72,17 @@ class PendingRequest:
 
 
 @dataclass
+class DownloadItem:
+    user: str
+    path: str
+    dest: str = ""
+    label: str = ""
+    progress: int = 0
+    status: str = "queued"
+    error: str = ""
+
+
+@dataclass
 class DownloadBatch:
     channel_id: int
     user_id: int
@@ -79,7 +90,7 @@ class DownloadBatch:
     query: str
     total_files: int
     request_ids: list[str] = field(default_factory=list)
-    progress: dict[str, int] = field(default_factory=dict)
+    items: dict[str, DownloadItem] = field(default_factory=dict)
     message_id: int = 0
     latest: str = ""
 
@@ -117,7 +128,18 @@ class BridgeState:
                     query=str(item["query"]),
                     total_files=max(1, int(item["total_files"])),
                     request_ids=[str(value) for value in (item.get("request_ids") or [])],
-                    progress={str(key): int(value) for key, value in (item.get("progress") or {}).items()},
+                    items={
+                        str(key): DownloadItem(
+                            user=str((value or {}).get("user") or ""),
+                            path=str((value or {}).get("path") or ""),
+                            dest=str((value or {}).get("dest") or ""),
+                            label=str((value or {}).get("label") or ""),
+                            progress=int((value or {}).get("progress") or 0),
+                            status=str((value or {}).get("status") or "queued"),
+                            error=str((value or {}).get("error") or ""),
+                        )
+                        for key, value in (item.get("items") or {}).items()
+                    },
                     message_id=int(item.get("message_id") or 0),
                     latest=str(item.get("latest") or ""),
                 )
@@ -148,7 +170,18 @@ class BridgeState:
                             "query": item.query,
                             "total_files": item.total_files,
                             "request_ids": list(item.request_ids),
-                            "progress": dict(item.progress),
+                            "items": {
+                                request_id: {
+                                    "user": value.user,
+                                    "path": value.path,
+                                    "dest": value.dest,
+                                    "label": value.label,
+                                    "progress": value.progress,
+                                    "status": value.status,
+                                    "error": value.error,
+                                }
+                                for request_id, value in item.items.items()
+                            },
                             "message_id": item.message_id,
                             "latest": item.latest,
                         }
@@ -191,57 +224,93 @@ async def poll_bridge(op: str, request_id: str, *, ready_when, timeout: float, i
     return last
 
 
+def item_progress(item: DownloadItem) -> int:
+    return max(0, min(100, int(item.progress or 0)))
+
+
 def batch_percent(batch: DownloadBatch) -> int:
-    values = [max(0, min(100, int(batch.progress.get(request_id, 0)))) for request_id in batch.request_ids]
+    values = [item_progress(batch.items.get(request_id, DownloadItem(user="", path=""))) for request_id in batch.request_ids]
     if not values:
         return 0
     return max(0, min(100, int(round(sum(values) / len(values)))))
 
 
 def batch_completed_count(batch: DownloadBatch) -> int:
-    return sum(1 for request_id in batch.request_ids if int(batch.progress.get(request_id, 0)) >= 100)
+    return sum(1 for request_id in batch.request_ids if batch.items.get(request_id) and batch.items[request_id].status == "finished")
 
 
 def progress_markers(percent: int) -> str:
     markers = []
     for threshold in (0, 25, 50, 75, 100):
-        markers.append(f"{'●' if percent >= threshold else '○'} {threshold}%")
-    return "  ".join(markers)
+        markers.append(f"{'●' if percent >= threshold else '○'}{threshold}")
+    return " ".join(markers)
+
+
+def item_status_prefix(item: DownloadItem) -> str:
+    return {
+        "finished": "✓",
+        "error": "✖",
+        "started": "↻",
+        "retrying": "↺",
+        "queued": "…",
+        "progress": "↻",
+    }.get(item.status, "•")
 
 
 def render_batch_message(batch: DownloadBatch) -> str:
     percent = batch_percent(batch)
     done = batch_completed_count(batch)
+    failed = sum(1 for request_id in batch.request_ids if batch.items.get(request_id) and batch.items[request_id].status == "error")
     title = "Download complete" if percent >= 100 and done >= batch.total_files else "Download progress"
     lines = [
         f"{title}: `{trim(batch.query, 140)}`",
-        f"Markers: {progress_markers(percent)}",
         f"Overall: {percent}%",
-        f"Files: {done}/{batch.total_files} finished",
+        f"Files: {done}/{batch.total_files} finished" + (f" • {failed} failed" if failed else ""),
+        "Tracks:",
     ]
+    for index, request_id in enumerate(batch.request_ids, start=1):
+        item = batch.items.get(request_id)
+        if item is None:
+            continue
+        label = trim(item.label or download_file_label(item.path), 54)
+        line = f"{index}. {item_status_prefix(item)} {label} [{progress_markers(item_progress(item))}]"
+        if item.status == "error" and item.error:
+            line += f" — {trim(item.error, 60)}"
+        lines.append(line)
     if batch.latest:
         lines.append(f"Latest: {trim(batch.latest, 180)}")
-    return "\n".join(lines)
+    if failed:
+        lines.append("Use Retry failed on the message to requeue failed tracks.")
+    return fit_discord_content("\n".join(lines))
 
 
-async def register_pending(request_ids: list[str], interaction: discord.Interaction, query: str) -> str:
-    clean_ids = [str(request_id).strip() for request_id in request_ids if str(request_id).strip()]
-    if not clean_ids:
+async def register_pending(entries: list[dict[str, Any]], interaction: discord.Interaction, query: str) -> str:
+    clean_entries = [entry for entry in (entries or []) if str((entry or {}).get("request_id") or "").strip()]
+    if not clean_entries:
         return ""
     channel_id = interaction.channel_id or interaction.user.id
     batch_id = str(uuid.uuid4())
+    request_ids = [str(entry["request_id"]).strip() for entry in clean_entries]
     batch = DownloadBatch(
         channel_id=channel_id,
         user_id=interaction.user.id,
         user_name=str(interaction.user),
         query=query,
-        total_files=len(clean_ids),
-        request_ids=list(clean_ids),
-        progress={request_id: 0 for request_id in clean_ids},
+        total_files=len(request_ids),
+        request_ids=list(request_ids),
+        items={
+            request_id: DownloadItem(
+                user=str(entry.get("user") or ""),
+                path=str(entry.get("path") or ""),
+                dest=str(entry.get("dest") or ""),
+                label=download_file_label(str(entry.get("path") or "")),
+            )
+            for request_id, entry in [(str(item["request_id"]).strip(), item) for item in clean_entries]
+        },
         latest="Queued",
     )
     state.batches[batch_id] = batch
-    for request_id in clean_ids:
+    for request_id in request_ids:
         state.pending[request_id] = PendingRequest(
             channel_id=channel_id,
             user_id=interaction.user.id,
@@ -374,18 +443,18 @@ async def send_message(channel_id: int, text: str) -> bool:
         return False
 
 
-async def send_message_with_id(channel_id: int, text: str) -> int:
+async def send_message_with_id(channel_id: int, text: str, view: discord.ui.View | None = None) -> int:
     channel = await get_channel(channel_id)
     if channel is None:
         return 0
     try:
-        message = await channel.send(fit_discord_content(text))
+        message = await channel.send(fit_discord_content(text), view=view)
         return int(message.id)
     except Exception:
         return 0
 
 
-async def edit_message(channel_id: int, message_id: int, text: str) -> bool:
+async def edit_message(channel_id: int, message_id: int, text: str, view: discord.ui.View | None = None) -> bool:
     if not message_id:
         return False
     channel = await get_channel(channel_id)
@@ -393,10 +462,81 @@ async def edit_message(channel_id: int, message_id: int, text: str) -> bool:
         return False
     try:
         message = await channel.fetch_message(int(message_id))
-        await message.edit(content=fit_discord_content(text))
+        await message.edit(content=fit_discord_content(text), view=view)
         return True
     except Exception:
         return False
+
+
+class RetryFailedDownloadsView(discord.ui.View):
+    def __init__(self, batch_id: str):
+        super().__init__(timeout=None)
+        self.batch_id = batch_id
+        button = discord.ui.Button(
+            label="Retry failed",
+            style=discord.ButtonStyle.blurple,
+            custom_id=f"retry_failed:{batch_id}",
+        )
+        button.callback = self.retry_failed
+        self.add_item(button)
+
+    async def retry_failed(self, interaction: discord.Interaction):
+        batch = state.batches.get(self.batch_id)
+        if batch is None:
+            await safe_send(interaction, content="That download batch is no longer active.", ephemeral=True)
+            return
+        failed_items = [
+            (request_id, item)
+            for request_id, item in [(request_id, batch.items.get(request_id)) for request_id in batch.request_ids]
+            if item is not None and item.status == "error"
+        ]
+        if not failed_items:
+            await safe_send(interaction, content="There are no failed tracks to retry right now.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        retried = 0
+        for old_request_id, item in failed_items:
+            reply = await bridge_call({
+                "op": "download",
+                "request_id": str(uuid.uuid4()),
+                "user": item.user,
+                "path": item.path,
+                "dest": item.dest,
+            })
+            entries = reply.get("entries") or []
+            if not reply.get("ok") or not entries:
+                item.error = reply.get("error", "retry failed")
+                continue
+            entry = entries[0]
+            new_request_id = str(entry.get("request_id") or "").strip()
+            if not new_request_id:
+                continue
+            new_item = DownloadItem(
+                user=str(entry.get("user") or item.user),
+                path=str(entry.get("path") or item.path),
+                dest=str(entry.get("dest") or item.dest),
+                label=download_file_label(str(entry.get("path") or item.path)),
+                progress=0,
+                status="retrying",
+                error="",
+            )
+            idx = batch.request_ids.index(old_request_id)
+            batch.request_ids[idx] = new_request_id
+            batch.items.pop(old_request_id, None)
+            batch.items[new_request_id] = new_item
+            state.pending.pop(old_request_id, None)
+            state.pending[new_request_id] = PendingRequest(
+                channel_id=batch.channel_id,
+                user_id=batch.user_id,
+                user_name=batch.user_name,
+                query=batch.query,
+                batch_id=self.batch_id,
+            )
+            retried += 1
+        batch.latest = f"Retried {retried} failed track(s)" if retried else batch.latest
+        state.save()
+        await ensure_batch_message(self.batch_id)
+        await safe_edit(interaction, content=f"Retried {retried} failed track(s).", view=None)
 
 
 async def ensure_batch_message(batch_id: str):
@@ -404,11 +544,12 @@ async def ensure_batch_message(batch_id: str):
     if batch is None:
         return False
     text = render_batch_message(batch)
+    view = RetryFailedDownloadsView(batch_id) if any(item.status == "error" for item in batch.items.values()) else None
     if batch.message_id:
-        ok = await edit_message(batch.channel_id, batch.message_id, text)
+        ok = await edit_message(batch.channel_id, batch.message_id, text, view=view)
         if ok:
             return True
-    batch.message_id = await send_message_with_id(batch.channel_id, text)
+    batch.message_id = await send_message_with_id(batch.channel_id, text, view=view)
     state.save()
     return bool(batch.message_id)
 
@@ -477,8 +618,8 @@ class BrowseDecisionView(discord.ui.View):
         if not reply.get("ok"):
             await safe_edit(interaction, content=f"Download failed: {reply}", view=None)
             return
-        request_ids = reply.get("request_ids", [])
-        batch_id = await register_pending(request_ids, interaction, f"{self.session.get('query', 'album')} :: {self.session.get('folder', '<root>')}")
+        entries = reply.get("entries") or [{"request_id": request_id} for request_id in (reply.get("request_ids") or [])]
+        batch_id = await register_pending(entries, interaction, f"{self.session.get('query', 'album')} :: {self.session.get('folder', '<root>')}")
         await ensure_batch_message(batch_id)
         await safe_edit(interaction, content=f"Queued {reply.get('queued', 0)} file(s) for download. Progress will update in-channel.", view=None)
 
@@ -527,7 +668,8 @@ class TrackSelectView(discord.ui.View):
             await safe_edit(interaction, content=f"Download failed: {reply}", view=None)
             return
         request_ids = reply.get("request_ids", [])
-        batch_id = await register_pending(request_ids, interaction, f"{self.session.get('query', 'album')} :: {self.session.get('folder', '<root>')}")
+        entries = reply.get("entries") or [{"request_id": request_id} for request_id in request_ids]
+        batch_id = await register_pending(entries, interaction, f"{self.session.get('query', 'album')} :: {self.session.get('folder', '<root>')}")
         await ensure_batch_message(batch_id)
         await safe_edit(interaction, content=f"Queued {reply.get('queued', 0)} selected track(s). Progress will update in-channel.", view=None)
 
@@ -561,6 +703,9 @@ async def setup_hook():
 async def on_ready():
     if not watch_bridge_events.is_running():
         watch_bridge_events.start()
+    for batch_id, batch in list(state.batches.items()):
+        if batch.message_id:
+            client.add_view(RetryFailedDownloadsView(batch_id))
     print(f"Logged in as {client.user} | socket={BRIDGE_SOCKET} | events={EVENTS_FILE} | state={STATE_FILE}")
 
 
@@ -618,8 +763,8 @@ async def slsk_download(interaction: discord.Interaction, user: str, path: str, 
     if not reply.get("ok"):
         await safe_send(interaction, content=f"Failed: {reply}", ephemeral=True)
         return
-    request_ids = reply.get("request_ids", [])
-    batch_id = await register_pending(request_ids, interaction, f"{user} :: {path}")
+    entries = reply.get("entries") or [{"request_id": request_id} for request_id in (reply.get("request_ids") or [])]
+    batch_id = await register_pending(entries, interaction, f"{user} :: {path}")
     await ensure_batch_message(batch_id)
     await safe_send(interaction, content=f"Queued exact path download for `{user}` -> `{path}`. Progress will update in-channel.", ephemeral=True)
 
@@ -670,22 +815,30 @@ async def watch_bridge_events():
         batch = state.batches.get(batch_id)
         if batch is None:
             continue
-        path_label = alert_path_label(str(event.get("path") or ""), DOWNLOAD_ALERT_MODE)
+        item = batch.items.get(request_id)
+        if item is None:
+            continue
+        path_label = item.label or download_file_label(str(event.get("path") or item.path or ""))
         if kind == "started":
-            batch.progress[request_id] = max(0, int(batch.progress.get(request_id, 0) or 0))
+            item.status = "started"
+            item.progress = max(item.progress, 0)
+            item.error = ""
             batch.latest = f"Started `{path_label}`"
             state.save()
             await ensure_batch_message(batch_id)
             continue
         if kind == "progress":
             percent = max(0, min(99, int(event.get("percent") or 0)))
-            batch.progress[request_id] = max(percent, int(batch.progress.get(request_id, 0) or 0))
+            item.status = "progress"
+            item.progress = max(percent, item.progress)
             batch.latest = f"{path_label} reached {percent}%"
             state.save()
             await ensure_batch_message(batch_id)
             continue
         if kind == "finished":
-            batch.progress[request_id] = 100
+            item.status = "finished"
+            item.progress = 100
+            item.error = ""
             batch.latest = f"Finished `{path_label}`"
             state.pending.pop(request_id, None)
             state.save()
@@ -695,7 +848,9 @@ async def watch_bridge_events():
                 state.save()
             continue
         if kind == "error":
-            batch.latest = f"Error on `{path_label}`: {event.get('error', 'unknown error')}"
+            item.status = "error"
+            item.error = str(event.get('error', 'unknown error'))
+            batch.latest = f"Error on `{path_label}`: {item.error}"
             state.pending.pop(request_id, None)
             state.save()
             await ensure_batch_message(batch_id)
