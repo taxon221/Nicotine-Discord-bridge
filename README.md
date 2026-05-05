@@ -1,4 +1,4 @@
-# Nicotine Discord Bridge
+# Nicotine+ Discord Bridge
 
 Discord slash commands that drive **Nicotine+**  on the same machine: search shares, browse a folder, queue downloads, and get upload-started alerts when someone pulls from you.
 
