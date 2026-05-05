@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-import sys
+import subprocess
 import threading
 import uuid
 from collections import defaultdict, deque
@@ -17,10 +17,9 @@ from pynicotine.pluginsystem import BasePlugin
 class Plugin(BasePlugin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        base_dir = self._default_data_dir()
+        base_dir = Path.home() / ".local" / "share" / "nicotine" / "discord-bridge"
         self.base_dir = base_dir
-        self.control_host = "127.0.0.1"
-        self.control_port = 0
+        self.socket_path = base_dir / "control.sock"
         self.events_path = base_dir / "events.jsonl"
         self.state_path = base_dir / "state.json"
         self.runtime_path = base_dir / "runtime.json"
@@ -31,6 +30,7 @@ class Plugin(BasePlugin):
             "emit_upload_finished": False,
             "emit_download_started": True,
             "emit_download_finished": True,
+            "bot_env_path": str(Path.home() / "nicotine-discord-bridge" / ".env"),
         }
         self.metasettings = {
             "results_limit": {
@@ -40,6 +40,10 @@ class Plugin(BasePlugin):
             "track_picker_limit": {
                 "description": "How many tracks Discord should show in the picker (max 25)",
                 "type": "integer",
+            },
+            "bot_env_path": {
+                "description": "Discord bot .env file path used by /bridgeenv",
+                "type": "string",
             },
             "emit_upload_started": {
                 "description": "Write upload-start events for Discord alerts",
@@ -58,6 +62,10 @@ class Plugin(BasePlugin):
                 "type": "bool",
             },
         }
+        self.__privatecommands__ = [
+            ("bridgeenv", self.open_env_command),
+            ("bridgepaths", self.show_paths_command),
+        ]
         self._stop = threading.Event()
         self._server_thread = None
         self._server_socket = None
@@ -73,9 +81,9 @@ class Plugin(BasePlugin):
     def loaded_notification(self):
         self._ensure_dirs()
         self._load_state()
-        self._start_server()
         self._write_runtime_manifest()
-        self.log(f"Discord bridge ready at {self.control_host}:{self.control_port} (events={self.events_path})")
+        self._start_server()
+        self.log(f"Discord bridge ready at {self.socket_path} (events={self.events_path})")
 
     def disable(self):
         self._shutdown()
@@ -89,16 +97,6 @@ class Plugin(BasePlugin):
     def _ensure_dirs(self):
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
-    @staticmethod
-    def _default_data_dir() -> Path:
-        home = Path.home()
-        if sys.platform == "win32":
-            base = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or home)
-            return base / "nicotine" / "discord-bridge"
-        if sys.platform == "darwin":
-            return home / "Library" / "Application Support" / "nicotine" / "discord-bridge"
-        return home / ".local" / "share" / "nicotine" / "discord-bridge"
-
     def _safe_int(self, value, default):
         try:
             return int(value)
@@ -111,15 +109,21 @@ class Plugin(BasePlugin):
     def _track_picker_limit(self) -> int:
         return max(1, min(25, self._safe_int(self.settings.get("track_picker_limit"), 25)))
 
+    def _bot_env_path(self) -> Path:
+        value = str(self.settings.get("bot_env_path") or "").strip()
+        if not value:
+            value = str(Path.home() / "nicotine-discord-bridge" / ".env")
+        return Path(value).expanduser()
+
     def _runtime_manifest(self) -> dict:
         return {
             "data_dir": str(self.base_dir),
-            "control_host": str(self.control_host),
-            "control_port": int(self.control_port),
+            "socket_path": str(self.socket_path),
             "events_path": str(self.events_path),
             "state_path": str(self.state_path),
             "results_limit": self._results_limit(),
             "track_picker_limit": self._track_picker_limit(),
+            "bot_env_path": str(self._bot_env_path()),
             "emit_upload_started": bool(self.settings.get("emit_upload_started", True)),
             "emit_upload_finished": bool(self.settings.get("emit_upload_finished", False)),
             "emit_download_started": bool(self.settings.get("emit_download_started", True)),
@@ -131,6 +135,19 @@ class Plugin(BasePlugin):
             self.runtime_path.write_text(json.dumps(self._runtime_manifest(), indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             self.log(f"Discord bridge runtime manifest write failed: {exc}")
+
+    def open_env_command(self, _source, _args):
+        env_path = self._bot_env_path()
+        try:
+            subprocess.Popen(["xdg-open", str(env_path)])
+            self.echo_message(f"Opened Discord bot env file: {env_path}")
+        except Exception as exc:
+            self.echo_message(f"Couldn't open {env_path}: {exc}")
+
+    def show_paths_command(self, _source, _args):
+        self.echo_message(
+            f"Discord bridge paths | socket={self.socket_path} | events={self.events_path} | state={self.state_path} | env={self._bot_env_path()}"
+        )
 
     def _load_state(self):
         try:
@@ -201,7 +218,7 @@ class Plugin(BasePlugin):
         return pages.get(user) if pages else None
 
     def _summarize_search_rows(self, rows) -> list[dict]:
-        groups: dict[tuple[str, str], dict] = {}
+        groups = {}
         for row in rows or []:
             try:
                 user = str(row[1])
@@ -304,16 +321,25 @@ class Plugin(BasePlugin):
         if self._server_thread and self._server_thread.is_alive():
             return
         self._stop.clear()
+        try:
+            if self.socket_path.exists():
+                self.socket_path.unlink()
+        except Exception:
+            pass
         self._server_thread = threading.Thread(target=self._serve, name="DiscordBridgeSocket", daemon=True)
         self._server_thread.start()
 
     def _serve(self):
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server_socket = server
         try:
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(("127.0.0.1", 0))
-            self.control_host, self.control_port = server.getsockname()[:2]
+            server.bind(str(self.socket_path))
+            try:
+                owner = self.base_dir.stat()
+                os.chown(self.socket_path, owner.st_uid, owner.st_gid)
+            except Exception as exc:
+                self.log(f"Discord bridge socket ownership fix failed: {exc}")
+            os.chmod(self.socket_path, 0o660)
             server.listen(5)
             server.settimeout(1.0)
             while not self._stop.is_set():
@@ -327,6 +353,11 @@ class Plugin(BasePlugin):
         finally:
             try:
                 server.close()
+            except Exception:
+                pass
+            try:
+                if self.socket_path.exists():
+                    self.socket_path.unlink()
             except Exception:
                 pass
 
@@ -501,4 +532,9 @@ class Plugin(BasePlugin):
         except Exception:
             pass
         self._server_socket = None
+        try:
+            if self.socket_path.exists():
+                self.socket_path.unlink()
+        except Exception:
+            pass
         self._save_state()
