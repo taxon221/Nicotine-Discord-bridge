@@ -4,9 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
+import socket
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,17 +16,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 
-def default_bridge_dir() -> Path:
-    home = Path.home()
-    if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or home)
-        return base / "nicotine" / "discord-bridge"
-    if sys.platform == "darwin":
-        return home / "Library" / "Application Support" / "nicotine" / "discord-bridge"
-    return home / ".local" / "share" / "nicotine" / "discord-bridge"
-
-
-DEFAULT_BRIDGE_DIR = default_bridge_dir()
+DEFAULT_BRIDGE_DIR = Path.home() / ".local" / "share" / "nicotine" / "discord-bridge"
 DEFAULT_RUNTIME_PATH = DEFAULT_BRIDGE_DIR / "runtime.json"
 
 
@@ -56,41 +47,32 @@ def load_env_file(path: Path):
         os.environ.setdefault(key, value)
 
 
-ENV_PATH = Path(os.environ.get("BRIDGE_BOT_ENV") or (Path.cwd() / ".env")).expanduser()
+RUNTIME = load_runtime()
+ENV_PATH = Path(RUNTIME.get("bot_env_path") or (Path.home() / "nicotine-discord-bridge" / ".env")).expanduser()
 load_env_file(ENV_PATH)
-
-_RT = load_runtime()
-
-
-def bridge_host_port() -> tuple[str, int]:
-    rt = load_runtime()
-    host = str(os.environ.get("NICOTINE_BRIDGE_HOST") or rt.get("control_host") or "127.0.0.1").strip() or "127.0.0.1"
-    try:
-        port = int(os.environ.get("NICOTINE_BRIDGE_PORT") or rt.get("control_port") or 0)
-    except (TypeError, ValueError):
-        port = 0
-    return host, port
-
-
-def _rt_path(key: str, default: Path) -> Path:
-    v = _RT.get(key)
-    return Path(v).expanduser() if v else default
-
-
-EVENTS_FILE = Path(os.environ.get("NICOTINE_BRIDGE_EVENTS") or _rt_path("events_path", DEFAULT_BRIDGE_DIR / "events.jsonl"))
-STATE_FILE = Path(os.environ.get("NICOTINE_BRIDGE_STATE") or (_rt_path("data_dir", DEFAULT_BRIDGE_DIR) / "bot-state.json"))
-RESULTS_LIMIT = max(1, min(25, int(_RT.get("results_limit", 5) or 5)))
-TRACK_PICKER_LIMIT = max(1, min(25, int(_RT.get("track_picker_limit", 25) or 25)))
+BRIDGE_SOCKET = Path(os.environ.get("NICOTINE_BRIDGE_SOCKET") or RUNTIME.get("socket_path") or (DEFAULT_BRIDGE_DIR / "control.sock")).expanduser()
+EVENTS_FILE = Path(os.environ.get("NICOTINE_BRIDGE_EVENTS") or RUNTIME.get("events_path") or (DEFAULT_BRIDGE_DIR / "events.jsonl")).expanduser()
+STATE_FILE = Path(os.environ.get("NICOTINE_BRIDGE_STATE") or (Path(RUNTIME.get("data_dir") or DEFAULT_BRIDGE_DIR) / "bot-state.json")).expanduser()
+RESULTS_LIMIT = max(1, min(25, int(RUNTIME.get("results_limit", 5) or 5)))
+TRACK_PICKER_LIMIT = max(1, min(25, int(RUNTIME.get("track_picker_limit", 25) or 25)))
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
 ALERT_CHANNEL_ID = os.environ.get("DISCORD_ALERT_CHANNEL_ID", "").strip()
+
+
+@dataclass
+class PendingRequest:
+    channel_id: int
+    user_id: int
+    user_name: str
+    query: str
 
 
 class BridgeState:
     def __init__(self, path: Path):
         self.path = path
         self.cursor = 0
-        self.pending: dict[str, dict[str, Any]] = {}
+        self.pending: dict[str, PendingRequest] = {}
         self.load()
 
     def load(self):
@@ -99,14 +81,33 @@ class BridgeState:
         self.pending = {}
         for request_id, item in (data.get("pending") or {}).items():
             try:
-                self.pending[request_id] = {"channel_id": int(item["channel_id"]), "query": str(item["query"])}
-            except (KeyError, TypeError, ValueError):
+                self.pending[request_id] = PendingRequest(
+                    channel_id=int(item["channel_id"]),
+                    user_id=int(item["user_id"]),
+                    user_name=str(item["user_name"]),
+                    query=str(item["query"]),
+                )
+            except Exception:
                 pass
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
-            json.dumps({"cursor": self.cursor, "pending": self.pending}, indent=2),
+            json.dumps(
+                {
+                    "cursor": self.cursor,
+                    "pending": {
+                        request_id: {
+                            "channel_id": item.channel_id,
+                            "user_id": item.user_id,
+                            "user_name": item.user_name,
+                            "query": item.query,
+                        }
+                        for request_id, item in self.pending.items()
+                    },
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
@@ -118,28 +119,16 @@ guild_obj = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 
 
 async def bridge_call(payload: dict[str, Any]) -> dict[str, Any]:
-    host, port = bridge_host_port()
-    if not port:
-        return {"ok": False, "error": f"bridge control_port missing (check runtime.json at {DEFAULT_RUNTIME_PATH} or set NICOTINE_BRIDGE_PORT)"}
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2.0)
-    except Exception as exc:
-        return {"ok": False, "error": f"bridge connect failed to {host}:{port}: {exc}"}
-    try:
-        writer.write((json.dumps(payload) + "\n").encode("utf-8"))
-        await writer.drain()
-        raw = await asyncio.wait_for(reader.readline(), timeout=10.0)
-        if not raw:
-            return {"ok": False, "error": "bridge returned empty response"}
-        return json.loads(raw.decode("utf-8").strip())
-    except Exception as exc:
-        return {"ok": False, "error": f"bridge call failed: {exc}"}
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
+    if not BRIDGE_SOCKET.exists():
+        return {"ok": False, "error": f"bridge socket not found: {BRIDGE_SOCKET}"}
+
+    def run_call():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(str(BRIDGE_SOCKET))
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            return json.loads(sock.recv(65536).decode("utf-8").strip())
+
+    return await asyncio.to_thread(run_call)
 
 
 async def poll_bridge(op: str, request_id: str, *, ready_when, timeout: float, interval: float) -> dict[str, Any]:
@@ -154,15 +143,34 @@ async def poll_bridge(op: str, request_id: str, *, ready_when, timeout: float, i
 
 
 def register_pending(request_ids: list[str], interaction: discord.Interaction, query: str):
-    ch = interaction.channel_id or interaction.user.id
     for request_id in request_ids:
-        state.pending[request_id] = {"channel_id": ch, "query": query}
+        state.pending[request_id] = PendingRequest(
+            channel_id=interaction.channel_id or interaction.user.id,
+            user_id=interaction.user.id,
+            user_name=str(interaction.user),
+            query=query,
+        )
     state.save()
+
+
+DISCORD_CONTENT_LIMIT = 2000
 
 
 def trim(text: str, limit: int) -> str:
     text = str(text or "")
     return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
+
+
+def fit_discord_content(text: str) -> str:
+    return trim(text, DISCORD_CONTENT_LIMIT)
+
+
+async def safe_edit(interaction: discord.Interaction, *, content: str, view=None):
+    await interaction.edit_original_response(content=fit_discord_content(content), view=view)
+
+
+async def safe_send(interaction: discord.Interaction, *, content: str, ephemeral: bool = True):
+    await interaction.response.send_message(fit_discord_content(content), ephemeral=ephemeral)
 
 
 def folder_name(path: str) -> str:
@@ -224,7 +232,7 @@ async def send_message(channel_id: int, text: str) -> bool:
     if channel is None:
         return False
     try:
-        await channel.send(text)
+        await channel.send(fit_discord_content(text))
         return True
     except Exception:
         return False
@@ -258,7 +266,7 @@ class SearchResultsView(discord.ui.View):
         request_id = str(uuid.uuid4())
         reply = await bridge_call({"op": "browse_folder", "request_id": request_id, "user": result["user"], "folder": result.get("folder", "")})
         if not reply.get("ok"):
-            await interaction.edit_original_response(content=f"Browse failed: {reply}", view=None)
+            await safe_edit(interaction, content=f"Browse failed: {reply}", view=None)
             return
         browse = await poll_bridge(
             "browse_folder_results",
@@ -268,7 +276,7 @@ class SearchResultsView(discord.ui.View):
             interval=1.5,
         )
         if not browse.get("ok") or not browse.get("ready"):
-            await interaction.edit_original_response(content=f"I couldn't load that folder yet: {browse}", view=None)
+            await safe_edit(interaction, content=f"I couldn't load that folder yet: {browse}", view=None)
             return
         files = browse.get("files") or []
         self.session.update({"browse_request_id": request_id, "browse": browse, "folder": browse.get("folder", ""), "files": files})
@@ -279,7 +287,7 @@ class SearchResultsView(discord.ui.View):
         )
         if len(files) > TRACK_PICKER_LIMIT:
             text += f"\nDiscord will only show the first {TRACK_PICKER_LIMIT} tracks in the picker."
-        await interaction.edit_original_response(content=text, view=BrowseDecisionView(self.session))
+        await safe_edit(interaction, content=text, view=BrowseDecisionView(self.session))
 
 
 class BrowseDecisionView(discord.ui.View):
@@ -292,17 +300,17 @@ class BrowseDecisionView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         reply = await bridge_call({"op": "download_folder", "request_id": self.session["browse_request_id"], "dest": ""})
         if not reply.get("ok"):
-            await interaction.edit_original_response(content=f"Download failed: {reply}", view=None)
+            await safe_edit(interaction, content=f"Download failed: {reply}", view=None)
             return
         request_ids = reply.get("request_ids", [])
         register_pending(request_ids, interaction, f"{self.session.get('query', 'album')} :: {self.session.get('folder', '<root>')}")
-        await interaction.edit_original_response(content=f"Queued {reply.get('queued', 0)} file(s) for download.", view=None)
+        await safe_edit(interaction, content=f"Queued {reply.get('queued', 0)} file(s) for download.", view=None)
 
     @discord.ui.button(label="Pick specific tracks", style=discord.ButtonStyle.blurple)
     async def pick_specific(self, interaction: discord.Interaction, _button: discord.ui.Button):
         files = (self.session.get("files") or [])[:TRACK_PICKER_LIMIT]
         if not files:
-            await interaction.response.send_message("No files were loaded for that folder.", ephemeral=True)
+            await safe_send(interaction, content="No files were loaded for that folder.", ephemeral=True)
             return
         await interaction.response.edit_message(content="Pick the tracks you want to download:", view=TrackSelectView(self.session, files))
 
@@ -340,11 +348,11 @@ class TrackSelectView(discord.ui.View):
             "dest": "",
         })
         if not reply.get("ok"):
-            await interaction.edit_original_response(content=f"Download failed: {reply}", view=None)
+            await safe_edit(interaction, content=f"Download failed: {reply}", view=None)
             return
         request_ids = reply.get("request_ids", [])
         register_pending(request_ids, interaction, f"{self.session.get('query', 'album')} :: {self.session.get('folder', '<root>')}")
-        await interaction.edit_original_response(content=f"Queued {reply.get('queued', 0)} selected track(s).", view=None)
+        await safe_edit(interaction, content=f"Queued {reply.get('queued', 0)} selected track(s).", view=None)
 
 
 async def sync_slash_commands():
@@ -376,8 +384,7 @@ async def setup_hook():
 async def on_ready():
     if not watch_bridge_events.is_running():
         watch_bridge_events.start()
-    host, port = bridge_host_port()
-    print(f"Logged in as {client.user} | bridge={host}:{port} | events={EVENTS_FILE} | state={STATE_FILE}")
+    print(f"Logged in as {client.user} | socket={BRIDGE_SOCKET} | events={EVENTS_FILE} | state={STATE_FILE}")
 
 
 slsk = app_commands.Group(name="slsk", description="Soulseek / Nicotine bridge commands")
@@ -386,7 +393,7 @@ slsk = app_commands.Group(name="slsk", description="Soulseek / Nicotine bridge c
 @slsk.command(name="ping", description="Check that the local Nicotine bridge is alive")
 async def slsk_ping(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await interaction.edit_original_response(content=f"Bridge: {await bridge_call({'op': 'ping'})}")
+    await safe_edit(interaction, content=f"Bridge: {await bridge_call({'op': 'ping'})}")
 
 
 @slsk.command(name="album", description="Search Soulseek for an album or folder, then choose what to download")
@@ -396,7 +403,7 @@ async def slsk_album(interaction: discord.Interaction, query: str):
     request_id = str(uuid.uuid4())
     reply = await bridge_call({"op": "search", "request_id": request_id, "query": query})
     if not reply.get("ok"):
-        await interaction.edit_original_response(content=f"Search failed: {reply}", view=None)
+        await safe_edit(interaction, content=f"Search failed: {reply}", view=None)
         return
     search = await poll_bridge(
         "search_results",
@@ -407,17 +414,18 @@ async def slsk_album(interaction: discord.Interaction, query: str):
     )
     results = search.get("results") or []
     if not search.get("ok") or not results:
-        await interaction.edit_original_response(content=f"No useful results found for `{query}` yet.", view=None)
+        await safe_edit(interaction, content=f"No useful results found for `{query}` yet.", view=None)
         return
     lines = [f"Top {len(results)} results for `{query}`:"]
     for index, result in enumerate(results, start=1):
-        sample = ", ".join(result.get("sample_files") or [])
-        line = f"{index}. {result.get('user')} :: {result.get('folder') or '<root>'} ({result.get('match_count', 0)} files, {result.get('size_human')})"
+        sample = trim(", ".join(result.get("sample_files") or []), 90)
+        line = f"{index}. {trim(result.get('user'), 40)} :: {trim(result.get('folder') or '<root>', 80)} ({result.get('match_count', 0)} files, {result.get('size_human')})"
         if sample:
             line += f" — {sample}"
         lines.append(line)
     lines.append(f"Use the dropdown to choose the folder / album you want. (limit: {RESULTS_LIMIT})")
-    await interaction.edit_original_response(
+    await safe_edit(
+        interaction,
         content="\n".join(lines),
         view=SearchResultsView({"query": query, "search_request_id": reply["request_id"], "results": results}, results),
     )
@@ -434,10 +442,10 @@ async def slsk_download(interaction: discord.Interaction, user: str, path: str, 
         "dest": destination or "",
     })
     if not reply.get("ok"):
-        await interaction.response.send_message(f"Failed: {reply}", ephemeral=True)
+        await safe_send(interaction, content=f"Failed: {reply}", ephemeral=True)
         return
     register_pending(reply.get("request_ids", []), interaction, f"{user} :: {path}")
-    await interaction.response.send_message(f"Queued exact path download for `{user}` -> `{path}`", ephemeral=True)
+    await safe_send(interaction, content=f"Queued exact path download for `{user}` -> `{path}`", ephemeral=True)
 
 
 tree.add_command(slsk)
@@ -475,16 +483,16 @@ async def watch_bridge_events():
         pending = state.pending[request_id]
         message = None
         if kind == "started":
-            message = f"Download started: `{pending['query']}`"
+            message = f"Download started: `{pending.query}`"
         elif kind == "finished":
             state.pending.pop(request_id, None)
             state.save()
         elif kind == "error":
-            message = f"Error on `{pending['query']}`: {event.get('error', 'unknown error')}"
+            message = f"Error on `{pending.query}`: {event.get('error', 'unknown error')}"
             state.pending.pop(request_id, None)
             state.save()
         if message:
-            await send_message(pending["channel_id"], message)
+            await send_message(pending.channel_id, message)
 
 
 if __name__ == "__main__":
