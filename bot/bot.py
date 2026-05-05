@@ -246,15 +246,26 @@ def progress_markers(percent: int) -> str:
     return " ".join(markers)
 
 
-def item_status_prefix(item: DownloadItem) -> str:
+def active_batch_item(batch: DownloadBatch) -> tuple[int, DownloadItem | None]:
+    for index, request_id in enumerate(batch.request_ids, start=1):
+        item = batch.items.get(request_id)
+        if item is not None and item.status in {"started", "progress", "retrying", "queued", "error"}:
+            return index, item
+    if batch.request_ids:
+        item = batch.items.get(batch.request_ids[-1])
+        return len(batch.request_ids), item
+    return 0, None
+
+
+def current_item_heading(item: DownloadItem) -> str:
     return {
-        "finished": "✓",
-        "error": "✖",
-        "started": "↻",
-        "retrying": "↺",
-        "queued": "…",
-        "progress": "↻",
-    }.get(item.status, "•")
+        "finished": "Done",
+        "error": "Failed",
+        "started": "Downloading",
+        "retrying": "Retrying",
+        "queued": "Queued",
+        "progress": "Downloading",
+    }.get(item.status, "Current")
 
 
 def render_batch_message(batch: DownloadBatch) -> str:
@@ -266,18 +277,15 @@ def render_batch_message(batch: DownloadBatch) -> str:
         f"{title}: `{trim(batch.query, 140)}`",
         f"Overall: {percent}%",
         f"Files: {done}/{batch.total_files} finished" + (f" • {failed} failed" if failed else ""),
-        "Tracks:",
     ]
-    for index, request_id in enumerate(batch.request_ids, start=1):
-        item = batch.items.get(request_id)
-        if item is None:
-            continue
-        label = trim(item.label or download_file_label(item.path), 54)
-        line = f"{index}. {item_status_prefix(item)} {label} [{progress_markers(item_progress(item))}]"
-        if item.status == "error" and item.error:
-            line += f" — {trim(item.error, 60)}"
-        lines.append(line)
-    if batch.latest:
+    current_index, current_item = active_batch_item(batch)
+    if current_item is not None:
+        label = trim(current_item.label or download_file_label(current_item.path), 100)
+        lines.append(f"{current_item_heading(current_item)}: {current_index}/{batch.total_files} `{label}`")
+        lines.append(f"Track: [{progress_markers(item_progress(current_item))}]")
+        if current_item.status == "error" and current_item.error:
+            lines.append(f"Error: {trim(current_item.error, 140)}")
+    if batch.latest and (current_item is None or current_item.status != "error"):
         lines.append(f"Latest: {trim(batch.latest, 180)}")
     if failed:
         lines.append("Use Retry failed on the message to requeue failed tracks.")
@@ -588,11 +596,11 @@ class SearchResultsView(discord.ui.View):
             "browse_folder_results",
             request_id,
             ready_when=lambda item: item.get("ok") and item.get("ready"),
-            timeout=25.0,
-            interval=1.5,
+            timeout=60.0,
+            interval=2.0,
         )
         if not browse.get("ok") or not browse.get("ready"):
-            await safe_edit(interaction, content=f"I couldn't load that folder yet: {browse}", view=None)
+            await safe_edit(interaction, content="That library is still loading / parsing on their side. Try the same result again in a bit if it never finishes.", view=None)
             return
         files = browse.get("files") or []
         self.session.update({"browse_request_id": request_id, "browse": browse, "folder": browse.get("folder", ""), "files": files})
@@ -731,12 +739,12 @@ async def slsk_album(interaction: discord.Interaction, query: str):
         "search_results",
         reply["request_id"],
         ready_when=lambda item: item.get("ok") and bool(item.get("results")),
-        timeout=18.0,
+        timeout=35.0,
         interval=2.0,
     )
     results = search.get("results") or []
     if not search.get("ok") or not results:
-        await safe_edit(interaction, content=f"No useful results found for `{query}` yet.", view=None)
+        await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
         return
     lines = [f"Top {len(results)} results for `{query}`:"]
     for index, result in enumerate(results, start=1):
