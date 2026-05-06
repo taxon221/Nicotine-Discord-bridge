@@ -442,6 +442,141 @@ class Plugin(BasePlugin):
             if item["name"] in wanted or item["fullpath"] in wanted
         ]
 
+    @staticmethod
+    def _split_key(key: str) -> tuple[str, str]:
+        user, _sep, virtual_path = str(key).partition("\0")
+        return user, virtual_path
+
+    def _find_download_transfer(self, user: str, virtual_path: str):
+        transfers = getattr(getattr(self.core, "transfers", None), "downloads", None) or []
+        for download in list(transfers):
+            if str(getattr(download, "user", "") or "") != user:
+                continue
+            if str(getattr(download, "filename", "") or "") != virtual_path:
+                continue
+            return download
+        return None
+
+    def _queue_entries(self) -> list[dict]:
+        with self._lock:
+            pending_snapshot = {key: list(values) for key, values in self._pending.items()}
+            active_snapshot = dict(self._active)
+        entries = []
+        for key, request_ids in pending_snapshot.items():
+            user, virtual_path = self._split_key(key)
+            transfer = self._find_download_transfer(user, virtual_path)
+            active_request_id = active_snapshot.get(key)
+            status = str(getattr(transfer, "status", "Queued") or "Queued") if transfer is not None else "Queued"
+            current = self._safe_int(getattr(transfer, "current_byte_offset", 0), 0) if transfer is not None else 0
+            total = self._safe_int(getattr(transfer, "size", 0), 0) if transfer is not None else 0
+            percent = max(0, min(100, int((current * 100) / total))) if total > 0 and current > 0 else 0
+            queue_position = self._safe_int(getattr(transfer, "queue_position", 0), 0) if transfer is not None else 0
+            for index, request_id in enumerate(request_ids, start=1):
+                is_active = request_id == active_request_id
+                item_status = status if is_active else "Queued"
+                entries.append({
+                    "request_id": request_id,
+                    "user": user,
+                    "path": virtual_path,
+                    "status": item_status,
+                    "active": is_active,
+                    "queue_index": index,
+                    "queue_depth": len(request_ids),
+                    "queue_position": queue_position,
+                    "current_bytes": current if is_active else 0,
+                    "total_bytes": total if is_active else 0,
+                    "percent": percent if is_active else 0,
+                })
+        entries.sort(key=lambda item: (0 if item["active"] else 1, item["user"].lower(), item["path"].lower(), item["request_id"]))
+        return entries
+
+    def _resolve_request_entry(self, request_token: str):
+        token = str(request_token or "").strip()
+        if not token:
+            return None, "request_id is required"
+        entries = self._queue_entries()
+        exact = [entry for entry in entries if entry["request_id"] == token]
+        if len(exact) == 1:
+            return exact[0], None
+        prefix = [entry for entry in entries if entry["request_id"].startswith(token)]
+        if not prefix:
+            return None, f"unknown request_id: {token}"
+        if len(prefix) > 1:
+            choices = ", ".join(entry["request_id"][:8] for entry in prefix[:5])
+            more = "…" if len(prefix) > 5 else ""
+            return None, f"request_id prefix is ambiguous: {choices}{more}"
+        return prefix[0], None
+
+    def _remove_entry(self, entry: dict, *, reason: str = "Removed from queue") -> dict:
+        user = entry["user"]
+        virtual_path = entry["path"]
+        request_id = entry["request_id"]
+        key = self._key(user, virtual_path)
+        transfer = self._find_download_transfer(user, virtual_path)
+        if transfer is not None and getattr(transfer, "status", "") != "Finished":
+            try:
+                transfer.status = "Cancelled"
+                self.core.transfers.abort_transfer(transfer)
+            except Exception:
+                pass
+            try:
+                if transfer in self.core.transfers.downloads:
+                    self.core.transfers.downloads.remove(transfer)
+                    if self.core.transfers.downloadsview:
+                        self.core.transfers.downloadsview.remove_specific(transfer, True)
+            except Exception:
+                pass
+        with self._lock:
+            queue = self._pending.get(key)
+            if queue and request_id in queue:
+                try:
+                    queue.remove(request_id)
+                except ValueError:
+                    pass
+                if not queue:
+                    self._pending.pop(key, None)
+            if self._active.get(key) == request_id:
+                self._active.pop(key, None)
+            self._save_state()
+        self._progress_marks.pop(request_id, None)
+        self._append_event({"event": "removed", "request_id": request_id, "user": user, "path": virtual_path, "reason": reason})
+        return entry
+
+    def _remove_download_request(self, request_token: str) -> dict:
+        entry, error = self._resolve_request_entry(request_token)
+        if entry is None:
+            return {"ok": False, "error": error}
+        self._remove_entry(entry)
+        request_id = entry["request_id"]
+        return {"ok": True, "removed": [entry], "message": f"Removed {request_id[:8]} from queue"}
+
+    def _remove_download_matching(self, *, user: str = "", path_contains: str = "") -> dict:
+        user_token = str(user or "").strip().lower()
+        path_token = str(path_contains or "").strip().lower()
+        if not user_token and not path_token:
+            return {"ok": False, "error": "provide user and/or path_contains"}
+        entries = self._queue_entries()
+        matched = []
+        for entry in entries:
+            entry_user = str(entry.get("user") or "")
+            entry_path = str(entry.get("path") or "")
+            if user_token and entry_user.lower() != user_token:
+                continue
+            if path_token and path_token not in entry_path.lower():
+                continue
+            matched.append(entry)
+        if not matched:
+            target = user or path_contains
+            return {"ok": False, "error": f"no queued downloads matched: {target}"}
+        removed = [self._remove_entry(entry, reason="Bulk removed from queue") for entry in matched]
+        summary_bits = []
+        if user_token:
+            summary_bits.append(f"user={user}")
+        if path_token:
+            summary_bits.append(f"path~={path_contains}")
+        summary = ", ".join(summary_bits)
+        return {"ok": True, "removed": removed, "message": f"Removed {len(removed)} queue item(s) matching {summary}"}
+
     def _start_server(self):
         if self._server_thread and self._server_thread.is_alive():
             return
@@ -642,6 +777,18 @@ class Plugin(BasePlugin):
             dest = str(request.get("dest") or "").strip()
             queued = [self._queue_entry(session["user"], item["fullpath"], dest=dest) for item in resolved]
             return {"ok": True, "queued": len(queued), "request_ids": [item["request_id"] for item in queued], "entries": queued, "files": resolved}
+
+        if op == "queue_list":
+            return {"ok": True, "entries": self._queue_entries()}
+
+        if op == "queue_remove":
+            return self._remove_download_request(str(request.get("request_id") or request.get("id") or "").strip())
+
+        if op == "queue_remove_matching":
+            return self._remove_download_matching(
+                user=str(request.get("user") or "").strip(),
+                path_contains=str(request.get("path_contains") or request.get("path") or "").strip(),
+            )
 
         return {"ok": False, "error": f"unknown op: {op or '<empty>'}"}
 

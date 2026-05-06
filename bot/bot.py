@@ -198,6 +198,9 @@ state = BridgeState(STATE_FILE)
 client = discord.Client(intents=discord.Intents.default())
 tree = app_commands.CommandTree(client)
 guild_obj = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
+BATCH_EDIT_COOLDOWN_SECONDS = 8.0
+batch_last_edit_at: dict[str, float] = {}
+dirty_batches: set[str] = set()
 
 
 async def bridge_call(payload: dict[str, Any]) -> dict[str, Any]:
@@ -268,10 +271,27 @@ def current_item_heading(item: DownloadItem) -> str:
     }.get(item.status, "Current")
 
 
+def final_batch_message(batch: DownloadBatch, *, failed: int) -> str:
+    first_item = next((batch.items.get(request_id) for request_id in batch.request_ids if batch.items.get(request_id) is not None), None)
+    source_user = trim(first_item.user, 80) if first_item and first_item.user else "someone"
+    if batch.total_files <= 1 and first_item is not None:
+        label = trim(first_item.label or download_file_label(first_item.path), 120)
+        return fit_discord_content(f"Download `{label}` from `{source_user}` finished!")
+    target = trim(download_album_label(first_item.path), 120) if first_item and first_item.path else trim(batch.query, 120)
+    summary = f"Download `{target}` from `{source_user}` finished!"
+    if batch.total_files > 1:
+        summary += f" ({batch.total_files} files)"
+    if failed:
+        summary += f" • {failed} failed"
+    return fit_discord_content(summary)
+
+
 def render_batch_message(batch: DownloadBatch) -> str:
     percent = batch_percent(batch)
     done = batch_completed_count(batch)
     failed = sum(1 for request_id in batch.request_ids if batch.items.get(request_id) and batch.items[request_id].status == "error")
+    if done >= batch.total_files and failed == 0:
+        return final_batch_message(batch, failed=failed)
     title = "Download complete" if percent >= 100 and done >= batch.total_files else "Download progress"
     lines = [
         f"{title}: `{trim(batch.query, 140)}`",
@@ -547,19 +567,103 @@ class RetryFailedDownloadsView(discord.ui.View):
         await safe_edit(interaction, content=f"Retried {retried} failed track(s).", view=None)
 
 
-async def ensure_batch_message(batch_id: str):
+async def ensure_batch_message(batch_id: str, *, force: bool = False):
     batch = state.batches.get(batch_id)
     if batch is None:
+        dirty_batches.discard(batch_id)
+        batch_last_edit_at.pop(batch_id, None)
+        return False
+    now = time.monotonic()
+    if batch.message_id and not force and (now - batch_last_edit_at.get(batch_id, 0.0)) < BATCH_EDIT_COOLDOWN_SECONDS:
+        dirty_batches.add(batch_id)
         return False
     text = render_batch_message(batch)
     view = RetryFailedDownloadsView(batch_id) if any(item.status == "error" for item in batch.items.values()) else None
     if batch.message_id:
         ok = await edit_message(batch.channel_id, batch.message_id, text, view=view)
         if ok:
+            batch_last_edit_at[batch_id] = time.monotonic()
+            dirty_batches.discard(batch_id)
             return True
     batch.message_id = await send_message_with_id(batch.channel_id, text, view=view)
     state.save()
+    if batch.message_id:
+        batch_last_edit_at[batch_id] = time.monotonic()
+        dirty_batches.discard(batch_id)
     return bool(batch.message_id)
+
+
+async def flush_dirty_batch_updates():
+    now = time.monotonic()
+    for batch_id in list(dirty_batches):
+        batch = state.batches.get(batch_id)
+        if batch is None:
+            dirty_batches.discard(batch_id)
+            batch_last_edit_at.pop(batch_id, None)
+            continue
+        if not batch.message_id or (now - batch_last_edit_at.get(batch_id, 0.0)) >= BATCH_EDIT_COOLDOWN_SECONDS:
+            await ensure_batch_message(batch_id, force=True)
+
+
+def render_queue_entries(entries: list[dict[str, Any]], *, limit: int = 15) -> str:
+    shown = list(entries[: max(1, limit)])
+    if not shown:
+        return "Bridge queue is empty."
+    lines = [f"Bridge queue ({len(entries)} item(s)):"]
+    for index, entry in enumerate(shown, start=1):
+        request_id = str(entry.get("request_id") or "")
+        short_id = request_id[:8] or "unknown"
+        user = trim(str(entry.get("user") or "unknown"), 40)
+        label = trim(download_file_label(str(entry.get("path") or "")), 90)
+        status = str(entry.get("status") or "Queued")
+        percent = max(0, min(100, int(entry.get("percent") or 0)))
+        active = bool(entry.get("active"))
+        queue_index = int(entry.get("queue_index") or 0)
+        queue_depth = int(entry.get("queue_depth") or 0)
+        queue_position = int(entry.get("queue_position") or 0)
+        detail = status
+        if active and percent:
+            detail += f" {percent}%"
+        elif queue_position:
+            detail += f" pos {queue_position}"
+        elif queue_depth > 1:
+            detail += f" dup {queue_index}/{queue_depth}"
+        prefix = "▶" if active else "•"
+        lines.append(f"{index}. {prefix} [{short_id}] {user} — `{label}` ({detail})")
+    if len(entries) > len(shown):
+        lines.append(f"…and {len(entries) - len(shown)} more.")
+    lines.append("Remove one with /slsk unqueue request:<id or prefix>")
+    lines.append("Or bulk remove with /slsk unqueue [user:name] [path_contains:text]")
+    return fit_discord_content("\n".join(lines))
+
+
+async def remove_request_from_state(request_id: str, *, reason: str = "Removed from queue") -> None:
+    pending = state.pending.pop(request_id, None)
+    if pending is None:
+        state.save()
+        return
+    batch_id = pending.batch_id
+    batch = state.batches.get(batch_id)
+    if batch is None:
+        state.save()
+        return
+    item = batch.items.pop(request_id, None)
+    batch.request_ids = [value for value in batch.request_ids if value != request_id]
+    if batch.request_ids:
+        batch.total_files = len(batch.request_ids)
+        label = trim((item.label if item else "") or download_file_label(item.path if item else ""), 120) if item else request_id[:8]
+        batch.latest = f"{reason}: `{label}`"
+        state.save()
+        await ensure_batch_message(batch_id, force=True)
+        return
+    channel_id = batch.channel_id
+    message_id = batch.message_id
+    state.batches.pop(batch_id, None)
+    state.save()
+    dirty_batches.discard(batch_id)
+    batch_last_edit_at.pop(batch_id, None)
+    if message_id:
+        await edit_message(channel_id, message_id, "Download queue cleared.", view=None)
 
 
 class SearchResultSelect(discord.ui.Select):
@@ -777,12 +881,84 @@ async def slsk_download(interaction: discord.Interaction, user: str, path: str, 
     await safe_send(interaction, content=f"Queued exact path download for `{user}` -> `{path}`. Progress will update in-channel.", ephemeral=True)
 
 
+@slsk.command(name="queue", description="Show the current Nicotine bridge download queue")
+@app_commands.describe(limit="How many queued items to show (default 15, max 25)")
+async def slsk_queue(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 25] = 15):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    reply = await bridge_call({"op": "queue_list"})
+    if not reply.get("ok"):
+        await safe_edit(interaction, content=f"Queue lookup failed: {reply}", view=None)
+        return
+    await safe_edit(interaction, content=render_queue_entries(reply.get("entries") or [], limit=limit), view=None)
+
+
+@slsk.command(name="unqueue", description="Remove queued downloads by request id/prefix or by bulk filters")
+@app_commands.describe(
+    request="Optional request id or unique prefix from /slsk queue",
+    user="Optional Soulseek username to bulk filter by",
+    path_contains="Optional text that must appear in the queued path",
+)
+async def slsk_unqueue(
+    interaction: discord.Interaction,
+    request: str | None = None,
+    user: str | None = None,
+    path_contains: str | None = None,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if request:
+        reply = await bridge_call({"op": "queue_remove", "request_id": request})
+        if not reply.get("ok"):
+            await safe_edit(interaction, content=f"Queue removal failed: {reply}", view=None)
+            return
+        for entry in reply.get("removed") or []:
+            request_id = str(entry.get("request_id") or "").strip()
+            if request_id:
+                await remove_request_from_state(request_id, reason="Removed from queue")
+        removed = reply.get("removed") or []
+        if removed:
+            entry = removed[0]
+            label = trim(download_file_label(str(entry.get("path") or "")), 120)
+            owner = trim(str(entry.get("user") or "unknown"), 80)
+            await safe_edit(interaction, content=f"Removed `{label}` from `{owner}` queue.", view=None)
+            return
+        await safe_edit(interaction, content=str(reply.get("message") or "Queue item removed."), view=None)
+        return
+    if not (user or path_contains):
+        await safe_edit(interaction, content="Give me either request, user, or path_contains.", view=None)
+        return
+    reply = await bridge_call({
+        "op": "queue_remove_matching",
+        "user": user or "",
+        "path_contains": path_contains or "",
+    })
+    if not reply.get("ok"):
+        await safe_edit(interaction, content=f"Bulk queue removal failed: {reply}", view=None)
+        return
+    removed = reply.get("removed") or []
+    for entry in removed:
+        request_id = str(entry.get("request_id") or "").strip()
+        if request_id:
+            await remove_request_from_state(request_id, reason="Bulk removed from queue")
+    filters = []
+    if user:
+        filters.append(f"user `{trim(user, 80)}`")
+    if path_contains:
+        filters.append(f"path containing `{trim(path_contains, 80)}`")
+    target = " and ".join(filters) if filters else "filters"
+    await safe_edit(
+        interaction,
+        content=f"Removed {len(removed)} queued item(s) matching {target}.",
+        view=None,
+    )
+
+
 tree.add_command(slsk)
 
 
 @tasks.loop(seconds=2.5)
 async def watch_bridge_events():
     if not EVENTS_FILE.exists():
+        await flush_dirty_batch_updates()
         return
     try:
         with EVENTS_FILE.open("r", encoding="utf-8") as handle:
@@ -790,7 +966,10 @@ async def watch_bridge_events():
             lines = handle.readlines()
             state.cursor = handle.tell()
     except Exception:
+        await flush_dirty_batch_updates()
         return
+    touched_batches: dict[str, bool] = {}
+    state_changed = bool(lines)
     if lines:
         state.save()
     for raw in lines:
@@ -816,6 +995,9 @@ async def watch_bridge_events():
                 label = alert_path_label(str(path or ""), UPLOAD_ALERT_MODE)
                 await send_message(channel.id, f"Someone finished downloading from you: `{user}` -> `{label}`")
             continue
+        if kind == "removed" and request_id:
+            await remove_request_from_state(request_id, reason=str(event.get("reason") or "Removed from queue"))
+            continue
         if not request_id or request_id not in state.pending:
             continue
         pending = state.pending[request_id]
@@ -827,41 +1009,48 @@ async def watch_bridge_events():
         if item is None:
             continue
         path_label = item.label or download_file_label(str(event.get("path") or item.path or ""))
+        force_refresh = False
         if kind == "started":
             item.status = "started"
             item.progress = max(item.progress, 0)
             item.error = ""
             batch.latest = f"Started `{path_label}`"
-            state.save()
-            await ensure_batch_message(batch_id)
-            continue
-        if kind == "progress":
+        elif kind == "progress":
             percent = max(0, min(99, int(event.get("percent") or 0)))
             item.status = "progress"
             item.progress = max(percent, item.progress)
             batch.latest = f"{path_label} reached {percent}%"
-            state.save()
-            await ensure_batch_message(batch_id)
-            continue
-        if kind == "finished":
+        elif kind == "finished":
             item.status = "finished"
             item.progress = 100
             item.error = ""
             batch.latest = f"Finished `{path_label}`"
             state.pending.pop(request_id, None)
-            state.save()
-            await ensure_batch_message(batch_id)
-            if batch_completed_count(batch) >= batch.total_files:
-                state.batches.pop(batch_id, None)
-                state.save()
-            continue
-        if kind == "error":
+            force_refresh = batch_completed_count(batch) >= batch.total_files
+        elif kind == "error":
             item.status = "error"
             item.error = str(event.get('error', 'unknown error'))
             batch.latest = f"Error on `{path_label}`: {item.error}"
             state.pending.pop(request_id, None)
-            state.save()
-            await ensure_batch_message(batch_id)
+        else:
+            continue
+        state_changed = True
+        touched_batches[batch_id] = touched_batches.get(batch_id, False) or force_refresh
+    if state_changed:
+        state.save()
+    completed_batches: list[str] = []
+    for batch_id, force_refresh in touched_batches.items():
+        await ensure_batch_message(batch_id, force=force_refresh)
+        batch = state.batches.get(batch_id)
+        if batch is not None and batch.request_ids and batch_completed_count(batch) >= batch.total_files:
+            completed_batches.append(batch_id)
+    if completed_batches:
+        for batch_id in completed_batches:
+            state.batches.pop(batch_id, None)
+            dirty_batches.discard(batch_id)
+            batch_last_edit_at.pop(batch_id, None)
+        state.save()
+    await flush_dirty_batch_updates()
 
 
 if __name__ == "__main__":
