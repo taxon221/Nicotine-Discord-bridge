@@ -39,7 +39,7 @@ class Plugin(BasePlugin):
             "results_limit": 5,
             "track_picker_limit": 25,
             "emit_upload_started": True,
-            "emit_upload_finished": False,
+            "emit_upload_finished": True,
             "emit_download_started": True,
             "emit_download_finished": True,
             "upload_alert_mode": "file",
@@ -64,7 +64,7 @@ class Plugin(BasePlugin):
                 "type": "bool",
             },
             "emit_upload_finished": {
-                "description": "Write upload-finished events",
+                "description": "Write upload-finished events for grouped Discord progress updates",
                 "type": "bool",
             },
             "emit_download_started": {
@@ -160,7 +160,7 @@ class Plugin(BasePlugin):
             "track_picker_limit": self._track_picker_limit(),
             "bot_env_path": str(self._bot_env_path()),
             "emit_upload_started": bool(self.settings.get("emit_upload_started", True)),
-            "emit_upload_finished": bool(self.settings.get("emit_upload_finished", False)),
+            "emit_upload_finished": bool(self.settings.get("emit_upload_finished", True)),
             "emit_download_started": bool(self.settings.get("emit_download_started", True)),
             "emit_download_finished": bool(self.settings.get("emit_download_finished", True)),
             "upload_alert_mode": self._upload_alert_mode(),
@@ -396,6 +396,35 @@ class Plugin(BasePlugin):
         files.sort(key=lambda item: item["fullpath"].lower())
         return files
 
+    def _folder_total_files_from_real_path(self, real_path: str) -> int:
+        try:
+            parent = Path(str(real_path or "")).expanduser().resolve().parent
+        except Exception:
+            return 0
+        try:
+            return sum(1 for entry in parent.iterdir() if entry.is_file())
+        except Exception:
+            return 0
+
+    def _folder_label(self, folder: str, user: str = "") -> str:
+        artist, album = self._artist_album_from_folder(folder, user=user)
+        if artist and artist.lower() != album.lower():
+            return f"{artist} — {album}"
+        return album or "<root>"
+
+    def _upload_event_payload(self, event_name: str, user, virtual_path, real_path) -> dict:
+        folder, _, filename = str(virtual_path or "").rpartition("\\")
+        return {
+            "event": event_name,
+            "user": user,
+            "path": virtual_path,
+            "real_path": real_path,
+            "folder": folder,
+            "file": filename or str(virtual_path or ""),
+            "folder_label": self._folder_label(folder, user=user),
+            "folder_total_files": self._folder_total_files_from_real_path(real_path),
+        }
+
     def _resolve_browse_session(self, request_id: str):
         session = self._browse_sessions.get(request_id)
         if not session:
@@ -429,10 +458,22 @@ class Plugin(BasePlugin):
         request_id = self._queue_file(user, virtual_path, dest=dest, request_id=request_id)
         return {"request_id": request_id, "user": user, "path": virtual_path, "dest": dest}
 
+    def _folder_download_dest(self, user: str, folder: str, root_folder: str = "", dest: str = "") -> str:
+        folder = str(folder or "")
+        root_folder = str(root_folder or folder)
+        if dest:
+            base_dir = os.path.abspath(os.path.expanduser(dest))
+        else:
+            base_dir = self.core.transfers.get_default_download_folder(user)
+        album_name = self._clean_name(self._split_virtual_path(root_folder)[-1] if root_folder else "")
+        album_name = album_name or self._clean_name(self._split_virtual_path(folder)[-1] if folder else "") or "album"
+        return os.path.join(base_dir, album_name)
+
     def _queue_folder(self, user: str, folder: str, shares, dest: str = "") -> list[dict]:
         queued = []
         for item in self._iter_share_files(shares, folder=folder, recursive=True):
-            queued.append(self._queue_entry(user, item["fullpath"], dest=dest))
+            item_dest = self._folder_download_dest(user, item["folder"], root_folder=folder, dest=dest)
+            queued.append(self._queue_entry(user, item["fullpath"], dest=item_dest))
         return queued
 
     def _resolve_files_by_names(self, shares, folder: str, names) -> list[dict]:
@@ -775,7 +816,14 @@ class Plugin(BasePlugin):
                 return payload
             resolved = self._resolve_files_by_names(session["shares"], session["folder"], request.get("files") or [])
             dest = str(request.get("dest") or "").strip()
-            queued = [self._queue_entry(session["user"], item["fullpath"], dest=dest) for item in resolved]
+            queued = [
+                self._queue_entry(
+                    session["user"],
+                    item["fullpath"],
+                    dest=self._folder_download_dest(session["user"], item.get("folder", session["folder"]), root_folder=session["folder"], dest=dest),
+                )
+                for item in resolved
+            ]
             return {"ok": True, "queued": len(queued), "request_ids": [item["request_id"] for item in queued], "entries": queued, "files": resolved}
 
         if op == "queue_list":
@@ -854,12 +902,12 @@ class Plugin(BasePlugin):
     def upload_started_notification(self, user, virtual_path, real_path):
         if not self.settings.get("emit_upload_started", True):
             return
-        self._append_event({"event": "upload_started", "user": user, "path": virtual_path, "real_path": real_path})
+        self._append_event(self._upload_event_payload("upload_started", user, virtual_path, real_path))
 
     def upload_finished_notification(self, user, virtual_path, real_path):
-        if not self.settings.get("emit_upload_finished", False):
+        if not self.settings.get("emit_upload_finished", True):
             return
-        self._append_event({"event": "upload_finished", "user": user, "path": virtual_path, "real_path": real_path})
+        self._append_event(self._upload_event_payload("upload_finished", user, virtual_path, real_path))
 
     def _shutdown(self):
         self._stop.set()

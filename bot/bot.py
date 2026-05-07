@@ -95,6 +95,18 @@ class DownloadBatch:
     latest: str = ""
 
 
+@dataclass
+class UploadAlert:
+    channel_id: int
+    user: str
+    folder: str
+    label: str
+    total_files: int = 0
+    files: dict[str, str] = field(default_factory=dict)
+    message_id: int = 0
+    latest: str = ""
+
+
 class BridgeState:
     def __init__(self, path: Path):
         self.path = path
@@ -201,6 +213,9 @@ guild_obj = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 BATCH_EDIT_COOLDOWN_SECONDS = 8.0
 batch_last_edit_at: dict[str, float] = {}
 dirty_batches: set[str] = set()
+upload_alerts: dict[str, UploadAlert] = {}
+upload_alert_last_edit_at: dict[str, float] = {}
+dirty_upload_alerts: set[str] = set()
 
 
 async def bridge_call(payload: dict[str, Any]) -> dict[str, Any]:
@@ -422,6 +437,94 @@ def download_album_label(path: str) -> str:
 
 def alert_path_label(path: str, mode: str) -> str:
     return download_album_label(path) if mode == "album" else download_file_label(path)
+
+
+def upload_alert_key(user: str, folder: str) -> str:
+    return f"{str(user or '')}\0{str(folder or '')}"
+
+
+def upload_alert_counts(alert: UploadAlert) -> tuple[int, int]:
+    started = len(alert.files)
+    finished = sum(1 for status in alert.files.values() if status == "finished")
+    return started, finished
+
+
+def render_upload_alert(alert: UploadAlert) -> str:
+    started, finished = upload_alert_counts(alert)
+    title = f"Someone started downloading from you: `{trim(alert.user or 'unknown', 80)}`"
+    lines = [title, f"Folder: `{trim(alert.label or '<root>', 140)}`"]
+    if alert.total_files > 0:
+        lines.append(f"Files: {started}/{alert.total_files} started" + (f" • {finished}/{started} finished" if finished else ""))
+    else:
+        lines.append(f"Files: {started} started" + (f" • {finished} finished" if finished else ""))
+    if alert.latest:
+        lines.append(f"Latest: {trim(alert.latest, 180)}")
+    return fit_discord_content("\n".join(lines))
+
+
+async def ensure_upload_alert_message(alert_id: str, *, force: bool = False):
+    alert = upload_alerts.get(alert_id)
+    if alert is None:
+        dirty_upload_alerts.discard(alert_id)
+        return
+    text = render_upload_alert(alert)
+    view = None
+    now = time.monotonic()
+    if not force:
+        last = upload_alert_last_edit_at.get(alert_id, 0.0)
+        if alert.message_id and now - last < BATCH_EDIT_COOLDOWN_SECONDS:
+            dirty_upload_alerts.add(alert_id)
+            return
+    if alert.message_id:
+        updated = await edit_message(alert.channel_id, alert.message_id, text, view=view)
+        if updated:
+            upload_alert_last_edit_at[alert_id] = now
+            dirty_upload_alerts.discard(alert_id)
+            return
+    message_id = await send_message_with_id(alert.channel_id, text, view=view)
+    if message_id:
+        alert.message_id = message_id
+        upload_alert_last_edit_at[alert_id] = now
+        dirty_upload_alerts.discard(alert_id)
+
+
+async def flush_dirty_upload_alerts():
+    for alert_id in list(dirty_upload_alerts):
+        await ensure_upload_alert_message(alert_id, force=True)
+
+
+async def record_upload_alert_event(event: dict[str, Any]):
+    channel = await resolve_alert_channel()
+    if channel is None:
+        return
+    user = str(event.get("user") or "unknown")
+    path = str(event.get("path") or "")
+    folder = str(event.get("folder") or path.rpartition("\\")[0] or "")
+    alert_id = upload_alert_key(user, folder)
+    label = str(event.get("folder_label") or alert_path_label(folder or path, "album") or "<root>")
+    total_files = max(0, int(event.get("folder_total_files") or 0))
+    file_label = download_file_label(path)
+    alert = upload_alerts.get(alert_id)
+    if alert is None:
+        alert = UploadAlert(channel_id=channel.id, user=user, folder=folder, label=label, total_files=total_files)
+        upload_alerts[alert_id] = alert
+    else:
+        alert.channel_id = channel.id
+        if total_files > alert.total_files:
+            alert.total_files = total_files
+        if label and label != "<root>":
+            alert.label = label
+    kind = str(event.get("event") or "")
+    if kind == "upload_started":
+        alert.files[path] = "started"
+        alert.latest = f"Started `{file_label}`"
+    elif kind == "upload_finished":
+        if path:
+            alert.files[path] = "finished"
+        alert.latest = f"Finished `{file_label}`"
+    else:
+        return
+    await ensure_upload_alert_message(alert_id)
 
 
 def track_label(item: dict[str, Any]) -> str:
@@ -959,6 +1062,7 @@ tree.add_command(slsk)
 async def watch_bridge_events():
     if not EVENTS_FILE.exists():
         await flush_dirty_batch_updates()
+        await flush_dirty_upload_alerts()
         return
     try:
         with EVENTS_FILE.open("r", encoding="utf-8") as handle:
@@ -967,6 +1071,7 @@ async def watch_bridge_events():
             state.cursor = handle.tell()
     except Exception:
         await flush_dirty_batch_updates()
+        await flush_dirty_upload_alerts()
         return
     touched_batches: dict[str, bool] = {}
     state_changed = bool(lines)
@@ -980,20 +1085,10 @@ async def watch_bridge_events():
         kind = event.get("event")
         request_id = event.get("request_id")
         if kind == "upload_started":
-            channel = await resolve_alert_channel()
-            if channel is not None:
-                user = event.get("user", "unknown")
-                path = event.get("path", "")
-                label = alert_path_label(str(path or ""), UPLOAD_ALERT_MODE)
-                await send_message(channel.id, f"Someone started downloading from you: `{user}` -> `{label}`")
+            await record_upload_alert_event(event)
             continue
         if kind == "upload_finished":
-            channel = await resolve_alert_channel()
-            if channel is not None:
-                user = event.get("user", "unknown")
-                path = event.get("path", "")
-                label = alert_path_label(str(path or ""), UPLOAD_ALERT_MODE)
-                await send_message(channel.id, f"Someone finished downloading from you: `{user}` -> `{label}`")
+            await record_upload_alert_event(event)
             continue
         if kind == "removed" and request_id:
             await remove_request_from_state(request_id, reason=str(event.get("reason") or "Removed from queue"))
@@ -1051,6 +1146,7 @@ async def watch_bridge_events():
             batch_last_edit_at.pop(batch_id, None)
         state.save()
     await flush_dirty_batch_updates()
+    await flush_dirty_upload_alerts()
 
 
 if __name__ == "__main__":
