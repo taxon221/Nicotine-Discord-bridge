@@ -6,6 +6,7 @@ import re
 import socket
 import subprocess
 import threading
+import time
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -48,39 +49,39 @@ class Plugin(BasePlugin):
         }
         self.metasettings = {
             "results_limit": {
-                "description": "How many album/folder results Discord should show per search",
+                "description": "Set how many album or folder results Discord shows per search",
                 "type": "integer",
             },
             "track_picker_limit": {
-                "description": "How many tracks Discord should show in the picker (max 25)",
+                "description": "Set how many tracks Discord shows in the picker (max 25)",
                 "type": "integer",
             },
             "bot_env_path": {
-                "description": "Discord bot .env file path used by /bridgeenv",
+                "description": "Set the Discord bot .env file path used by /bridgeenv",
                 "type": "string",
             },
             "emit_upload_started": {
-                "description": "Write upload-start events for Discord alerts",
+                "description": "Write upload started events for Discord alerts",
                 "type": "bool",
             },
             "emit_upload_finished": {
-                "description": "Write upload-finished events for grouped Discord progress updates",
+                "description": "Write upload finished events for Discord alerts",
                 "type": "bool",
             },
             "emit_download_started": {
-                "description": "Write download-started events",
+                "description": "Write download started events for Discord alerts",
                 "type": "bool",
             },
             "emit_download_finished": {
-                "description": "Write download-finished events",
+                "description": "Write download finished events for Discord alerts",
                 "type": "bool",
             },
             "upload_alert_mode": {
-                "description": "Discord alert granularity for uploads: file or album",
+                "description": "Set Discord alert granularity for uploads: file or album",
                 "type": "string",
             },
             "download_alert_mode": {
-                "description": "Discord alert granularity for downloads: file or album",
+                "description": "Set Discord alert granularity for downloads: file or album",
                 "type": "string",
             },
         }
@@ -98,6 +99,7 @@ class Plugin(BasePlugin):
         self._progress_marks = {}
         self._search_sessions = {}
         self._browse_sessions = {}
+        self._folder_download_sessions = {}
 
     def init(self):
         self._ensure_dirs()
@@ -249,6 +251,30 @@ class Plugin(BasePlugin):
         pages = getattr(ui, "pages", None)
         return pages.get(token) if pages else None
 
+    def _clear_search_session(self, request_id: str) -> bool:
+        session = self._search_sessions.pop(str(request_id or "").strip(), None)
+        if not session:
+            return False
+        token = session.get("token")
+        ui = getattr(getattr(self.core, "search", None), "ui_callback", None)
+        if ui is None:
+            return False
+        try:
+            frame = getattr(ui, "frame", None)
+            entry = getattr(frame, "search_entry", None)
+            if entry is not None:
+                entry.set_text("")
+        except Exception:
+            pass
+        try:
+            remove_search = getattr(ui, "remove_search", None)
+            if callable(remove_search) and token is not None:
+                remove_search(token)
+                return True
+        except Exception:
+            return False
+        return False
+
     def _browse_page(self, user):
         ui = getattr(getattr(self.core, "userbrowse", None), "ui_callback", None)
         pages = getattr(ui, "pages", None)
@@ -321,7 +347,7 @@ class Plugin(BasePlugin):
         labels = [self._format_label(ext) for ext, _count in ranked[:2]]
         return labels[0] if len(labels) == 1 else " + ".join(labels)
 
-    def _summarize_search_rows(self, rows) -> list[dict]:
+    def _summarize_search_rows(self, rows, *, offset: int = 0, limit: int | None = None) -> tuple[list[dict], int]:
         groups = {}
         for row in rows or []:
             try:
@@ -346,6 +372,7 @@ class Plugin(BasePlugin):
                     "audio_file_count": 0,
                     "size_bytes": 0,
                     "sample_files": [],
+                    "visible_files": [],
                     "format_counts": {},
                 },
             )
@@ -357,13 +384,23 @@ class Plugin(BasePlugin):
                 item["format_counts"][ext] = item["format_counts"].get(ext, 0) + 1
             if len(item["sample_files"]) < 3:
                 item["sample_files"].append(filename)
+            item["visible_files"].append({
+                "name": filename,
+                "fullpath": fullpath,
+                "size_bytes": size,
+                "size_human": self._human_size(size),
+            })
         results = list(groups.values())
         results.sort(key=lambda item: (-item["audio_file_count"], -item["match_count"], -item["size_bytes"], item["folder"].lower(), item["user"].lower()))
-        for item in results:
+        total = len(results)
+        start = max(0, self._safe_int(offset, 0))
+        end = total if limit is None else max(start, start + max(0, self._safe_int(limit, 0)))
+        sliced = results[start:end]
+        for item in sliced:
             item["size_human"] = self._human_size(item["size_bytes"])
             item["display_file_count"] = item["audio_file_count"] or item["match_count"]
             item["format_summary"] = self._format_summary(item.pop("format_counts", {}))
-        return results[: self._results_limit()]
+        return sliced, total
 
     def _iter_share_files(self, shares, folder: str = "", recursive: bool = False):
         for share_folder, file_list in (shares or {}).items():
@@ -395,6 +432,16 @@ class Plugin(BasePlugin):
             files = list(self._iter_share_files(shares))
         files.sort(key=lambda item: item["fullpath"].lower())
         return files
+
+    @staticmethod
+    def _virtual_path_in_folder(virtual_path: str, folder: str) -> bool:
+        virtual_path = str(virtual_path or "")
+        folder = str(folder or "").rstrip("\\")
+        if not virtual_path:
+            return False
+        if not folder:
+            return True
+        return virtual_path == folder or virtual_path.startswith(folder + "\\")
 
     def _folder_total_files_from_real_path(self, real_path: str) -> int:
         try:
@@ -457,6 +504,80 @@ class Plugin(BasePlugin):
     def _queue_entry(self, user: str, virtual_path: str, dest: str = "", request_id: str | None = None) -> dict:
         request_id = self._queue_file(user, virtual_path, dest=dest, request_id=request_id)
         return {"request_id": request_id, "user": user, "path": virtual_path, "dest": dest}
+
+    def _retry_download(self, user: str, virtual_path: str, dest: str = "", request_id: str | None = None) -> dict:
+        request_id = (request_id or str(uuid.uuid4())).strip()
+        transfer = self._find_download_transfer(user, virtual_path)
+        if transfer is None:
+            raise ValueError("existing transfer not found")
+        if dest:
+            try:
+                transfer.path = os.path.abspath(os.path.expanduser(dest))
+            except Exception:
+                pass
+        key = self._key(user, virtual_path)
+        with self._lock:
+            queue = self._pending[key]
+            if request_id not in queue:
+                queue.append(request_id)
+            self._active.pop(key, None)
+            self._save_state()
+        self.core.transfers.retry_download(transfer)
+        return {
+            "request_id": request_id,
+            "user": user,
+            "path": virtual_path,
+            "dest": str(getattr(transfer, "path", "") or dest),
+            "mode": "retried",
+        }
+
+    def _track_existing_transfer(self, request_group_id: str, user: str, virtual_path: str, dest: str = "") -> str:
+        request_id = str(uuid.uuid4()).strip()
+        key = self._key(user, virtual_path)
+        with self._lock:
+            if key in self._active or self._pending.get(key):
+                return ""
+            self._pending[key].append(request_id)
+            self._save_state()
+        self._append_event({
+            "event": "queued",
+            "request_id": request_id,
+            "request_group_id": request_group_id,
+            "user": user,
+            "path": virtual_path,
+            "dest": dest,
+        })
+        return request_id
+
+    def _discover_folder_download_transfers(self, transfers) -> None:
+        now = time.monotonic()
+        for request_group_id, session in list(self._folder_download_sessions.items()):
+            user = str(session.get("user") or "")
+            folder = str(session.get("folder") or "")
+            dest = str(session.get("dest") or "")
+            known_paths = session.setdefault("known_paths", set())
+            desired_dest = self._folder_download_dest(user, folder, root_folder=folder, dest=dest)
+            matched = False
+            for download in list(transfers):
+                download_user = str(getattr(download, "user", "") or "")
+                virtual_path = str(getattr(download, "filename", "") or "")
+                if download_user != user or not self._virtual_path_in_folder(virtual_path, folder):
+                    continue
+                matched = True
+                if getattr(download, "path", "") != desired_dest:
+                    try:
+                        download.path = desired_dest
+                    except Exception:
+                        pass
+                if virtual_path in known_paths:
+                    continue
+                known_paths.add(virtual_path)
+                self._track_existing_transfer(request_group_id, user, virtual_path, dest=desired_dest)
+            if matched:
+                session["last_seen"] = now
+                continue
+            if now - float(session.get("last_seen") or now) > 900:
+                self._folder_download_sessions.pop(request_group_id, None)
 
     def _folder_download_dest(self, user: str, folder: str, root_folder: str = "", dest: str = "") -> str:
         folder = str(folder or "")
@@ -645,6 +766,7 @@ class Plugin(BasePlugin):
 
     def _poll_download_progress(self):
         transfers = getattr(getattr(self.core, "transfers", None), "downloads", None) or []
+        self._discover_folder_download_transfers(transfers)
         for download in list(transfers):
             user = str(getattr(download, "user", "") or "")
             virtual_path = str(getattr(download, "filename", "") or "")
@@ -727,10 +849,15 @@ class Plugin(BasePlugin):
     def _handle_client(self, client: socket.socket):
         with client:
             try:
-                data = client.recv(65536)
-                if not data:
+                chunks = []
+                while True:
+                    data = client.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+                if not chunks:
                     return
-                request = json.loads(data.decode("utf-8"))
+                request = json.loads(b"".join(chunks).decode("utf-8"))
                 response = self._run_on_main_thread(request)
             except Exception as exc:
                 response = {"ok": False, "error": str(exc)}
@@ -779,7 +906,27 @@ class Plugin(BasePlugin):
                 return {"ok": False, "error": f"unknown search request_id: {request_id}"}
             page = self._search_page(session["token"])
             rows = list(getattr(page, "all_data", []) or []) if page else []
-            return {"ok": True, "ready": bool(page), "query": session["query"], "results": self._summarize_search_rows(rows)}
+            offset = self._safe_int(request.get("offset"), 0)
+            requested_limit = request.get("limit")
+            limit = self._safe_int(requested_limit, self._results_limit()) if requested_limit not in (None, "") else self._results_limit()
+            limit = max(1, min(100, limit))
+            results, total = self._summarize_search_rows(rows, offset=offset, limit=limit)
+            return {
+                "ok": True,
+                "ready": bool(page),
+                "query": session["query"],
+                "results": results,
+                "total_results": total,
+                "offset": offset,
+                "limit": limit,
+            }
+
+        if op == "clear_search":
+            request_id = str(request.get("request_id") or "").strip()
+            if not request_id:
+                return {"ok": False, "error": "request_id is required"}
+            cleared = self._clear_search_session(request_id)
+            return {"ok": True, "cleared": cleared, "request_id": request_id}
 
         if op == "browse_folder":
             user = str(request.get("user") or "").strip()
@@ -803,12 +950,64 @@ class Plugin(BasePlugin):
             request_id = self._queue_file(user, path, dest=dest)
             return {"ok": True, "queued": 1, "request_ids": [request_id], "entries": [{"request_id": request_id, "user": user, "path": path, "dest": dest}]}
 
+        if op == "retry_download":
+            user = str(request.get("user") or "").strip()
+            path = str(request.get("path") or "").strip()
+            dest = str(request.get("dest") or "").strip()
+            request_id = str(request.get("request_id") or uuid.uuid4()).strip()
+            if not user or not path:
+                return {"ok": False, "error": "user and path are required"}
+            try:
+                entry = self._retry_download(user, path, dest=dest, request_id=request_id)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            return {
+                "ok": True,
+                "retried": 1,
+                "request_ids": [entry["request_id"]],
+                "entries": [entry],
+            }
+
         if op == "download_folder":
             session, payload = self._resolve_browse_session(str(request.get("request_id") or "").strip())
             if not session or not payload.get("ready"):
                 return payload
             queued = self._queue_folder(session["user"], session["folder"], session["shares"], dest=str(request.get("dest") or "").strip())
             return {"ok": True, "queued": len(queued), "request_ids": [item["request_id"] for item in queued], "entries": queued}
+
+        if op == "download_search_folder":
+            user = str(request.get("user") or "").strip()
+            folder = str(request.get("folder") or "").strip()
+            dest = str(request.get("dest") or "").strip()
+            request_group_id = str(request.get("request_group_id") or uuid.uuid4()).strip()
+            visible_files = request.get("visible_files") or request.get("files") or []
+            if not user or not folder:
+                return {"ok": False, "error": "user and folder are required"}
+            folder_dest = self._folder_download_dest(user, folder, root_folder=folder, dest=dest)
+            queued = []
+            known_paths = set()
+            for item in visible_files:
+                fullpath = str((item or {}).get("fullpath") or (item or {}).get("path") or item or "")
+                if not fullpath or fullpath in known_paths:
+                    continue
+                known_paths.add(fullpath)
+                queued.append(self._queue_entry(user, fullpath, dest=folder_dest))
+            self._folder_download_sessions[request_group_id] = {
+                "user": user,
+                "folder": folder,
+                "dest": dest,
+                "known_paths": known_paths,
+                "last_seen": time.monotonic(),
+            }
+            self.core.transfers.get_folder(user, folder)
+            return {
+                "ok": True,
+                "queued": len(queued),
+                "request_ids": [item["request_id"] for item in queued],
+                "entries": queued,
+                "request_group_id": request_group_id,
+                "waiting_for_folder_contents": True,
+            }
 
         if op == "download_files":
             session, payload = self._resolve_browse_session(str(request.get("request_id") or "").strip())

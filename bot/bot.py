@@ -53,7 +53,6 @@ load_env_file(ENV_PATH)
 BRIDGE_SOCKET = Path(os.environ.get("NICOTINE_BRIDGE_SOCKET") or RUNTIME.get("socket_path") or (DEFAULT_BRIDGE_DIR / "control.sock")).expanduser()
 EVENTS_FILE = Path(os.environ.get("NICOTINE_BRIDGE_EVENTS") or RUNTIME.get("events_path") or (DEFAULT_BRIDGE_DIR / "events.jsonl")).expanduser()
 STATE_FILE = Path(os.environ.get("NICOTINE_BRIDGE_STATE") or (Path(RUNTIME.get("data_dir") or DEFAULT_BRIDGE_DIR) / "bot-state.json")).expanduser()
-RESULTS_LIMIT = max(1, min(25, int(RUNTIME.get("results_limit", 5) or 5)))
 TRACK_PICKER_LIMIT = max(1, min(25, int(RUNTIME.get("track_picker_limit", 25) or 25)))
 DOWNLOAD_ALERT_MODE = str(RUNTIME.get("download_alert_mode", "file") or "file").strip().lower()
 UPLOAD_ALERT_MODE = str(RUNTIME.get("upload_alert_mode", "file") or "file").strip().lower()
@@ -113,6 +112,7 @@ class BridgeState:
         self.cursor = 0
         self.pending: dict[str, PendingRequest] = {}
         self.batches: dict[str, DownloadBatch] = {}
+        self.download_groups: dict[str, str] = {}
         self.load()
 
     def load(self):
@@ -120,6 +120,7 @@ class BridgeState:
         self.cursor = int(data.get("cursor", 0) or 0)
         self.pending = {}
         self.batches = {}
+        self.download_groups = {str(key): str(value) for key, value in (data.get("download_groups") or {}).items() if str(key).strip() and str(value).strip()}
         for request_id, item in (data.get("pending") or {}).items():
             try:
                 self.pending[request_id] = PendingRequest(
@@ -174,6 +175,7 @@ class BridgeState:
                         }
                         for request_id, item in self.pending.items()
                     },
+                    "download_groups": dict(self.download_groups),
                     "batches": {
                         batch_id: {
                             "channel_id": item.channel_id,
@@ -211,6 +213,9 @@ client = discord.Client(intents=discord.Intents.default())
 tree = app_commands.CommandTree(client)
 guild_obj = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 BATCH_EDIT_COOLDOWN_SECONDS = 8.0
+RESULT_PAGE_SIZE = 10
+SEARCH_RESULTS_FETCH_LIMIT = 100
+BROWSE_RETRY_DELAY_SECONDS = 300.0
 batch_last_edit_at: dict[str, float] = {}
 dirty_batches: set[str] = set()
 upload_alerts: dict[str, UploadAlert] = {}
@@ -226,7 +231,15 @@ async def bridge_call(payload: dict[str, Any]) -> dict[str, Any]:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.connect(str(BRIDGE_SOCKET))
             sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-            return json.loads(sock.recv(65536).decode("utf-8").strip())
+            sock.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+            raw = b"".join(chunks).decode("utf-8").strip()
+            return json.loads(raw) if raw else {"ok": False, "error": "empty response from bridge"}
 
     return await asyncio.to_thread(run_call)
 
@@ -327,7 +340,7 @@ def render_batch_message(batch: DownloadBatch) -> str:
     return fit_discord_content("\n".join(lines))
 
 
-async def register_pending(entries: list[dict[str, Any]], interaction: discord.Interaction, query: str) -> str:
+async def register_pending(entries: list[dict[str, Any]], interaction: discord.Interaction, query: str, *, request_group_id: str = "") -> str:
     clean_entries = [entry for entry in (entries or []) if str((entry or {}).get("request_id") or "").strip()]
     if not clean_entries:
         return ""
@@ -353,6 +366,8 @@ async def register_pending(entries: list[dict[str, Any]], interaction: discord.I
         latest="Queued",
     )
     state.batches[batch_id] = batch
+    if request_group_id:
+        state.download_groups[request_group_id] = batch_id
     for request_id in request_ids:
         state.pending[request_id] = PendingRequest(
             channel_id=channel_id,
@@ -363,6 +378,12 @@ async def register_pending(entries: list[dict[str, Any]], interaction: discord.I
         )
     state.save()
     return batch_id
+
+
+def remove_batch_group_mappings(batch_id: str) -> None:
+    for group_id, mapped_batch_id in list(state.download_groups.items()):
+        if mapped_batch_id == batch_id:
+            state.download_groups.pop(group_id, None)
 
 
 DISCORD_CONTENT_LIMIT = 2000
@@ -418,6 +439,23 @@ def result_desc(result: dict[str, Any]) -> str:
     return trim(" • ".join(parts), 100)
 
 
+def render_search_results_page(query: str, results: list[dict[str, Any]], page: int) -> str:
+    total = len(results)
+    if total <= 0:
+        return f"No useful results found for `{query}` yet."
+    max_page = max(0, (total - 1) // RESULT_PAGE_SIZE)
+    page = max(0, min(page, max_page))
+    start = page * RESULT_PAGE_SIZE
+    end = min(total, start + RESULT_PAGE_SIZE)
+    lines = [f"Results {start + 1}-{end} of {total} for `{query}`:"]
+    for index, result in enumerate(results[start:end], start=start + 1):
+        lines.append(f"{index}. {result_label(result)} ({result_file_count(result)} files, {result.get('format_summary', 'unknown audio')})")
+    if total > RESULT_PAGE_SIZE:
+        lines.append("Use Prev 10 / Next 10 to page through results.")
+    lines.append("Use the dropdown to choose the folder / album you want.")
+    return "\n".join(lines)
+
+
 def download_file_label(path: str) -> str:
     parts = folder_parts(path)
     return trim(parts[-1] if parts else (path or "file"), 120)
@@ -450,15 +488,9 @@ def upload_alert_counts(alert: UploadAlert) -> tuple[int, int]:
 
 
 def render_upload_alert(alert: UploadAlert) -> str:
-    started, finished = upload_alert_counts(alert)
     title = f"Someone started downloading from you: `{trim(alert.user or 'unknown', 80)}`"
     lines = [title, f"Folder: `{trim(alert.label or '<root>', 140)}`"]
-    if alert.total_files > 0:
-        lines.append(f"Files: {started}/{alert.total_files} started" + (f" • {finished}/{started} finished" if finished else ""))
-    else:
-        lines.append(f"Files: {started} started" + (f" • {finished} finished" if finished else ""))
-    if alert.latest:
-        lines.append(f"Latest: {trim(alert.latest, 180)}")
+    lines.append(f"Files downloaded: {upload_alert_counts(alert)[1]}")
     return fit_discord_content("\n".join(lines))
 
 
@@ -626,10 +658,11 @@ class RetryFailedDownloadsView(discord.ui.View):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         retried = 0
-        for old_request_id, item in failed_items:
+        failed = 0
+        for request_id, item in failed_items:
             reply = await bridge_call({
-                "op": "download",
-                "request_id": str(uuid.uuid4()),
+                "op": "retry_download",
+                "request_id": request_id,
                 "user": item.user,
                 "path": item.path,
                 "dest": item.dest,
@@ -637,26 +670,17 @@ class RetryFailedDownloadsView(discord.ui.View):
             entries = reply.get("entries") or []
             if not reply.get("ok") or not entries:
                 item.error = reply.get("error", "retry failed")
+                failed += 1
                 continue
             entry = entries[0]
-            new_request_id = str(entry.get("request_id") or "").strip()
-            if not new_request_id:
-                continue
-            new_item = DownloadItem(
-                user=str(entry.get("user") or item.user),
-                path=str(entry.get("path") or item.path),
-                dest=str(entry.get("dest") or item.dest),
-                label=download_file_label(str(entry.get("path") or item.path)),
-                progress=0,
-                status="retrying",
-                error="",
-            )
-            idx = batch.request_ids.index(old_request_id)
-            batch.request_ids[idx] = new_request_id
-            batch.items.pop(old_request_id, None)
-            batch.items[new_request_id] = new_item
-            state.pending.pop(old_request_id, None)
-            state.pending[new_request_id] = PendingRequest(
+            item.user = str(entry.get("user") or item.user)
+            item.path = str(entry.get("path") or item.path)
+            item.dest = str(entry.get("dest") or item.dest)
+            item.label = download_file_label(item.path)
+            item.progress = 0
+            item.status = "retrying"
+            item.error = ""
+            state.pending[request_id] = PendingRequest(
                 channel_id=batch.channel_id,
                 user_id=batch.user_id,
                 user_name=batch.user_name,
@@ -664,10 +688,22 @@ class RetryFailedDownloadsView(discord.ui.View):
                 batch_id=self.batch_id,
             )
             retried += 1
-        batch.latest = f"Retried {retried} failed track(s)" if retried else batch.latest
+        if retried or failed:
+            summary = []
+            if retried:
+                summary.append(f"retried {retried}")
+            if failed:
+                summary.append(f"failed {failed}")
+            batch.latest = "Retry failed: " + ", ".join(summary)
         state.save()
         await ensure_batch_message(self.batch_id)
-        await safe_edit(interaction, content=f"Retried {retried} failed track(s).", view=None)
+        result_bits = []
+        if retried:
+            result_bits.append(f"retried {retried}")
+        if failed:
+            result_bits.append(f"failed {failed}")
+        result_text = ", ".join(result_bits) if result_bits else "nothing retried"
+        await safe_edit(interaction, content=f"Retry result: {result_text}.", view=None)
 
 
 async def ensure_batch_message(batch_id: str, *, force: bool = False):
@@ -762,6 +798,7 @@ async def remove_request_from_state(request_id: str, *, reason: str = "Removed f
     channel_id = batch.channel_id
     message_id = batch.message_id
     state.batches.pop(batch_id, None)
+    remove_batch_group_mappings(batch_id)
     state.save()
     dirty_batches.discard(batch_id)
     batch_last_edit_at.pop(batch_id, None)
@@ -770,14 +807,16 @@ async def remove_request_from_state(request_id: str, *, reason: str = "Removed f
 
 
 class SearchResultSelect(discord.ui.Select):
-    def __init__(self, results: list[dict[str, Any]]):
+    def __init__(self, results: list[dict[str, Any]], page: int):
+        start = page * RESULT_PAGE_SIZE
+        page_results = results[start:start + RESULT_PAGE_SIZE]
         super().__init__(
             placeholder="Pick a folder / album",
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=result_label(result, index + 1), description=result_desc(result) or None, value=str(index))
-                for index, result in enumerate(results)
+                discord.SelectOption(label=result_label(result, start + index + 1), description=result_desc(result) or None, value=str(start + index))
+                for index, result in enumerate(page_results)
             ],
         )
         self.results = results
@@ -786,39 +825,152 @@ class SearchResultSelect(discord.ui.Select):
         await self.view.choose_result(interaction, self.results[int(self.values[0])])
 
 
+async def attempt_browse_result(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    request_id = str(uuid.uuid4())
+    reply = await bridge_call({"op": "browse_folder", "request_id": request_id, "user": result["user"], "folder": result.get("folder", "")})
+    if not reply.get("ok"):
+        return request_id, reply
+    browse = await poll_bridge(
+        "browse_folder_results",
+        request_id,
+        ready_when=lambda item: item.get("ok") and item.get("ready"),
+        timeout=60.0,
+        interval=2.0,
+    )
+    return request_id, browse
+
+
+def render_browse_ready_text(result: dict[str, Any], files: list[dict[str, Any]]) -> str:
+    text = (
+        f"Selected `{artist_album_text(result)}`\n"
+        f"Matched audio files: {result_file_count(result)}\n"
+        f"Folder tracks found: {len(files)}"
+    )
+    if len(files) > TRACK_PICKER_LIMIT:
+        text += f"\nDiscord will only show the first {TRACK_PICKER_LIMIT} tracks in the picker."
+    return text
+
+
+async def retry_browse_result_later(interaction: discord.Interaction, session: dict[str, Any], result: dict[str, Any]) -> None:
+    await asyncio.sleep(BROWSE_RETRY_DELAY_SECONDS)
+    request_id, browse = await attempt_browse_result(result)
+    if browse.get("ok") and browse.get("ready"):
+        files = browse.get("files") or []
+        session.update({"browse_request_id": request_id, "browse": browse, "folder": browse.get("folder", ""), "files": files})
+        try:
+            await safe_edit(interaction, content=render_browse_ready_text(result, files), view=BrowseDecisionView(session))
+        except Exception:
+            return
+        return
+    try:
+        await safe_edit(
+            interaction,
+            content="That library was still loading after the automatic retry. Use Download all now, or try Pick specific tracks again later.",
+            view=ResultDecisionView(session, result),
+        )
+    except Exception:
+        return
+
+
 class SearchResultsView(discord.ui.View):
-    def __init__(self, session: dict[str, Any], results: list[dict[str, Any]]):
+    def __init__(self, session: dict[str, Any], results: list[dict[str, Any]], page: int = 0):
         super().__init__(timeout=600)
         self.session = session
-        self.add_item(SearchResultSelect(results))
+        self.results = results
+        self.page = max(0, page)
+        self._rebuild_items()
+
+    def _rebuild_items(self) -> None:
+        self.clear_items()
+        if self.results:
+            self.add_item(SearchResultSelect(self.results, self.page))
+        max_page = max(0, (len(self.results) - 1) // RESULT_PAGE_SIZE) if self.results else 0
+        prev_button = discord.ui.Button(label="Prev 10", style=discord.ButtonStyle.secondary, disabled=self.page <= 0)
+        next_button = discord.ui.Button(label="Next 10", style=discord.ButtonStyle.secondary, disabled=self.page >= max_page)
+
+        async def prev_callback(interaction: discord.Interaction):
+            await self.change_page(interaction, self.page - 1)
+
+        async def next_callback(interaction: discord.Interaction):
+            await self.change_page(interaction, self.page + 1)
+
+        prev_button.callback = prev_callback
+        next_button.callback = next_callback
+        self.add_item(prev_button)
+        self.add_item(next_button)
+
+    async def change_page(self, interaction: discord.Interaction, new_page: int):
+        max_page = max(0, (len(self.results) - 1) // RESULT_PAGE_SIZE) if self.results else 0
+        self.page = max(0, min(new_page, max_page))
+        self.session["page"] = self.page
+        self._rebuild_items()
+        await interaction.response.edit_message(content=render_search_results_page(self.session.get("query", "album"), self.results, self.page), view=self)
 
     async def choose_result(self, interaction: discord.Interaction, result: dict[str, Any]):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        request_id = str(uuid.uuid4())
-        reply = await bridge_call({"op": "browse_folder", "request_id": request_id, "user": result["user"], "folder": result.get("folder", "")})
-        if not reply.get("ok"):
-            await safe_edit(interaction, content=f"Browse failed: {reply}", view=None)
-            return
-        browse = await poll_bridge(
-            "browse_folder_results",
-            request_id,
-            ready_when=lambda item: item.get("ok") and item.get("ready"),
-            timeout=60.0,
-            interval=2.0,
+        self.session["selected_result"] = result
+        search_request_id = str(self.session.get("search_request_id") or "").strip()
+        if search_request_id:
+            try:
+                await bridge_call({"op": "clear_search", "request_id": search_request_id})
+            except Exception:
+                pass
+        text = (
+            f"Selected `{artist_album_text(result)}`\n"
+            f"Matched audio files in search: {result_file_count(result)}\n"
+            "Use Download all for the fast folder download. Pick specific tracks only if you want to browse their library."
         )
+        await interaction.response.edit_message(content=text, view=ResultDecisionView(self.session, result))
+
+
+class ResultDecisionView(discord.ui.View):
+    def __init__(self, session: dict[str, Any], result: dict[str, Any]):
+        super().__init__(timeout=600)
+        self.session = session
+        self.result = result
+
+    @discord.ui.button(label="Download all", style=discord.ButtonStyle.green)
+    async def download_all(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        request_group_id = str(uuid.uuid4())
+        reply = await bridge_call({
+            "op": "download_search_folder",
+            "request_group_id": request_group_id,
+            "user": self.result.get("user", ""),
+            "folder": self.result.get("folder", ""),
+            "visible_files": self.result.get("visible_files") or [],
+            "dest": "",
+        })
+        if not reply.get("ok"):
+            await safe_edit(interaction, content=f"Download failed: {reply}", view=None)
+            return
+        entries = reply.get("entries") or [{"request_id": request_id} for request_id in (reply.get("request_ids") or [])]
+        batch_id = await register_pending(
+            entries,
+            interaction,
+            f"{self.session.get('query', 'album')} :: {self.result.get('folder', '<root>')}",
+            request_group_id=str(reply.get("request_group_id") or request_group_id),
+        )
+        if batch_id:
+            await ensure_batch_message(batch_id)
+        queued = int(reply.get("queued", 0) or 0)
+        extra = " and requested the rest of the folder" if reply.get("waiting_for_folder_contents") else ""
+        await safe_edit(interaction, content=f"Queued {queued} visible file(s){extra}. Progress will update in-channel.", view=None)
+
+    @discord.ui.button(label="Pick specific tracks", style=discord.ButtonStyle.blurple)
+    async def pick_specific(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        request_id, browse = await attempt_browse_result(self.result)
         if not browse.get("ok") or not browse.get("ready"):
-            await safe_edit(interaction, content="That library is still loading / parsing on their side. Try the same result again in a bit if it never finishes.", view=None)
+            asyncio.create_task(retry_browse_result_later(interaction, dict(self.session), dict(self.result)))
+            await safe_edit(
+                interaction,
+                content="That library is still loading / parsing on their side. I'll retry the track picker automatically in 5 minutes and update this message.",
+                view=ResultDecisionView(self.session, self.result),
+            )
             return
         files = browse.get("files") or []
         self.session.update({"browse_request_id": request_id, "browse": browse, "folder": browse.get("folder", ""), "files": files})
-        text = (
-            f"Selected `{artist_album_text(result)}`\n"
-            f"Matched audio files: {result_file_count(result)}\n"
-            f"Folder tracks found: {len(files)}"
-        )
-        if len(files) > TRACK_PICKER_LIMIT:
-            text += f"\nDiscord will only show the first {TRACK_PICKER_LIMIT} tracks in the picker."
-        await safe_edit(interaction, content=text, view=BrowseDecisionView(self.session))
+        await safe_edit(interaction, content=render_browse_ready_text(self.result, files), view=BrowseDecisionView(self.session))
 
 
 class BrowseDecisionView(discord.ui.View):
@@ -949,19 +1101,19 @@ async def slsk_album(interaction: discord.Interaction, query: str):
         timeout=35.0,
         interval=2.0,
     )
-    results = search.get("results") or []
-    if not search.get("ok") or not results:
+    if not search.get("ok") or not (search.get("results") or []):
         await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
         return
-    lines = [f"Top {len(results)} results for `{query}`:"]
-    for index, result in enumerate(results, start=1):
-        line = f"{index}. {result_label(result)} ({result_file_count(result)} files, {result.get('format_summary', 'unknown audio')})"
-        lines.append(line)
-    lines.append(f"Use the dropdown to choose the folder / album you want. (limit: {RESULTS_LIMIT})")
+    full_search = await bridge_call({"op": "search_results", "request_id": reply["request_id"], "offset": 0, "limit": SEARCH_RESULTS_FETCH_LIMIT})
+    results = full_search.get("results") or search.get("results") or []
+    if not full_search.get("ok") or not results:
+        await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
+        return
+    session = {"query": query, "search_request_id": reply["request_id"], "results": results, "page": 0}
     await safe_edit(
         interaction,
-        content="\n".join(lines),
-        view=SearchResultsView({"query": query, "search_request_id": reply["request_id"], "results": results}, results),
+        content=render_search_results_page(query, results, 0),
+        view=SearchResultsView(session, results, page=0),
     )
 
 
@@ -1093,6 +1245,31 @@ async def watch_bridge_events():
         if kind == "removed" and request_id:
             await remove_request_from_state(request_id, reason=str(event.get("reason") or "Removed from queue"))
             continue
+        if kind == "queued" and request_id:
+            request_group_id = str(event.get("request_group_id") or "").strip()
+            batch_id = state.download_groups.get(request_group_id, "") if request_group_id else ""
+            batch = state.batches.get(batch_id) if batch_id else None
+            if batch is not None and request_id not in state.pending:
+                path = str(event.get("path") or "")
+                batch.request_ids.append(request_id)
+                batch.total_files = len(batch.request_ids)
+                batch.items[request_id] = DownloadItem(
+                    user=str(event.get("user") or ""),
+                    path=path,
+                    dest=str(event.get("dest") or ""),
+                    label=download_file_label(path),
+                )
+                batch.latest = f"Queued `{download_file_label(path)}`"
+                state.pending[request_id] = PendingRequest(
+                    channel_id=batch.channel_id,
+                    user_id=batch.user_id,
+                    user_name=batch.user_name,
+                    query=batch.query,
+                    batch_id=batch_id,
+                )
+                state_changed = True
+                touched_batches[batch_id] = True
+            continue
         if not request_id or request_id not in state.pending:
             continue
         pending = state.pending[request_id]
@@ -1142,6 +1319,7 @@ async def watch_bridge_events():
     if completed_batches:
         for batch_id in completed_batches:
             state.batches.pop(batch_id, None)
+            remove_batch_group_mappings(batch_id)
             dirty_batches.discard(batch_id)
             batch_last_edit_at.pop(batch_id, None)
         state.save()
