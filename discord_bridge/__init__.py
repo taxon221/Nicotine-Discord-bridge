@@ -25,6 +25,19 @@ GENERIC_FOLDER_NAMES = {
     "library", "lossless", "lossy", "media", "mixes", "mp3", "music", "new", "release", "releases",
     "rips", "shared", "share", "shares", "shared files", "soulseek", "unsorted", "various artists", "va", "web",
 }
+SETTING_SPECS = {
+    "results_limit": (5, "Set how many album or folder results Discord shows per search", "integer"),
+    "track_picker_limit": (25, "Set how many tracks Discord shows in the picker (max 25)", "integer"),
+    "bot_env_path": (str(Path.home() / "nicotine-discord-bridge" / ".env"), "Set the Discord bot .env file path used by /bridgeenv", "string"),
+    "emit_upload_started": (True, "Write upload started events for Discord alerts", "bool"),
+    "emit_upload_finished": (True, "Write upload finished events for Discord alerts", "bool"),
+    "emit_download_started": (True, "Write download started events for Discord alerts", "bool"),
+    "emit_download_finished": (True, "Write download finished events for Discord alerts", "bool"),
+    "upload_alert_mode": ("file", "Set Discord alert granularity for uploads: file or album", "string"),
+    "download_alert_mode": ("file", "Set Discord alert granularity for downloads: file or album", "string"),
+}
+DEFAULT_SETTINGS = {key: default for key, (default, _description, _value_type) in SETTING_SPECS.items()}
+METASETTINGS = {key: {"description": description, "type": value_type} for key, (_default, description, value_type) in SETTING_SPECS.items()}
 
 
 class Plugin(BasePlugin):
@@ -36,63 +49,11 @@ class Plugin(BasePlugin):
         self.events_path = base_dir / "events.jsonl"
         self.state_path = base_dir / "state.json"
         self.runtime_path = base_dir / "runtime.json"
-        self.settings = {
-            "results_limit": 5,
-            "track_picker_limit": 25,
-            "emit_upload_started": True,
-            "emit_upload_finished": True,
-            "emit_download_started": True,
-            "emit_download_finished": True,
-            "upload_alert_mode": "file",
-            "download_alert_mode": "file",
-            "bot_env_path": str(Path.home() / "nicotine-discord-bridge" / ".env"),
-        }
-        self.metasettings = {
-            "results_limit": {
-                "description": "Set how many album or folder results Discord shows per search",
-                "type": "integer",
-            },
-            "track_picker_limit": {
-                "description": "Set how many tracks Discord shows in the picker (max 25)",
-                "type": "integer",
-            },
-            "bot_env_path": {
-                "description": "Set the Discord bot .env file path used by /bridgeenv",
-                "type": "string",
-            },
-            "emit_upload_started": {
-                "description": "Write upload started events for Discord alerts",
-                "type": "bool",
-            },
-            "emit_upload_finished": {
-                "description": "Write upload finished events for Discord alerts",
-                "type": "bool",
-            },
-            "emit_download_started": {
-                "description": "Write download started events for Discord alerts",
-                "type": "bool",
-            },
-            "emit_download_finished": {
-                "description": "Write download finished events for Discord alerts",
-                "type": "bool",
-            },
-            "upload_alert_mode": {
-                "description": "Set Discord alert granularity for uploads: file or album",
-                "type": "string",
-            },
-            "download_alert_mode": {
-                "description": "Set Discord alert granularity for downloads: file or album",
-                "type": "string",
-            },
-        }
-        self.__privatecommands__ = [
-            ("bridgeenv", self.open_env_command),
-            ("bridgepaths", self.show_paths_command),
-        ]
+        self.settings = dict(DEFAULT_SETTINGS)
+        self.metasettings = {key: dict(value) for key, value in METASETTINGS.items()}
+        self.__privatecommands__ = [("bridgeenv", self.open_env_command), ("bridgepaths", self.show_paths_command)]
         self._stop = threading.Event()
-        self._server_thread = None
-        self._progress_thread = None
-        self._server_socket = None
+        self._server_thread = self._progress_thread = self._server_socket = None
         self._lock = threading.RLock()
         self._pending = defaultdict(deque)
         self._active = {}
@@ -115,11 +76,8 @@ class Plugin(BasePlugin):
     def disable(self):
         self._shutdown()
 
-    def shutdown_notification(self):
-        self._shutdown()
-
-    def unloaded_notification(self):
-        self._shutdown()
+    shutdown_notification = disable
+    unloaded_notification = disable
 
     def _ensure_dirs(self):
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -130,27 +88,15 @@ class Plugin(BasePlugin):
         except Exception:
             return default
 
-    def _results_limit(self) -> int:
-        return max(1, min(25, self._safe_int(self.settings.get("results_limit"), 5)))
-
-    def _track_picker_limit(self) -> int:
-        return max(1, min(25, self._safe_int(self.settings.get("track_picker_limit"), 25)))
+    def _setting_limit(self, key: str, default: int) -> int:
+        return max(1, min(25, self._safe_int(self.settings.get(key), default)))
 
     def _bot_env_path(self) -> Path:
-        value = str(self.settings.get("bot_env_path") or "").strip()
-        if not value:
-            value = str(Path.home() / "nicotine-discord-bridge" / ".env")
-        return Path(value).expanduser()
+        return Path(str(self.settings.get("bot_env_path") or Path.home() / "nicotine-discord-bridge" / ".env")).expanduser()
 
     def _alert_mode(self, key: str, default: str = "file") -> str:
         value = str(self.settings.get(key) or default).strip().lower()
         return value if value in {"file", "album"} else default
-
-    def _download_alert_mode(self) -> str:
-        return self._alert_mode("download_alert_mode", "file")
-
-    def _upload_alert_mode(self) -> str:
-        return self._alert_mode("upload_alert_mode", "file")
 
     def _runtime_manifest(self) -> dict:
         return {
@@ -158,15 +104,12 @@ class Plugin(BasePlugin):
             "socket_path": str(self.socket_path),
             "events_path": str(self.events_path),
             "state_path": str(self.state_path),
-            "results_limit": self._results_limit(),
-            "track_picker_limit": self._track_picker_limit(),
+            "results_limit": self._setting_limit("results_limit", 5),
+            "track_picker_limit": self._setting_limit("track_picker_limit", 25),
             "bot_env_path": str(self._bot_env_path()),
-            "emit_upload_started": bool(self.settings.get("emit_upload_started", True)),
-            "emit_upload_finished": bool(self.settings.get("emit_upload_finished", True)),
-            "emit_download_started": bool(self.settings.get("emit_download_started", True)),
-            "emit_download_finished": bool(self.settings.get("emit_download_finished", True)),
-            "upload_alert_mode": self._upload_alert_mode(),
-            "download_alert_mode": self._download_alert_mode(),
+            **{key: bool(self.settings.get(key, True)) for key in ("emit_upload_started", "emit_upload_finished", "emit_download_started", "emit_download_finished")},
+            "upload_alert_mode": self._alert_mode("upload_alert_mode"),
+            "download_alert_mode": self._alert_mode("download_alert_mode"),
         }
 
     def _write_runtime_manifest(self):
@@ -184,9 +127,7 @@ class Plugin(BasePlugin):
             self.echo_message(f"Couldn't open {env_path}: {exc}")
 
     def show_paths_command(self, _source, _args):
-        self.echo_message(
-            f"Discord bridge paths | socket={self.socket_path} | events={self.events_path} | state={self.state_path} | env={self._bot_env_path()}"
-        )
+        self.echo_message(f"Discord bridge paths | socket={self.socket_path} | events={self.events_path} | state={self.state_path} | env={self._bot_env_path()}")
 
     def _load_state(self):
         try:
@@ -201,8 +142,7 @@ class Plugin(BasePlugin):
         active = data.get("active", {})
         with self._lock:
             self._pending.clear()
-            for key, values in pending.items():
-                self._pending[key] = deque(values)
+            self._pending.update({key: deque(values) for key, values in pending.items()})
             self._active = dict(active)
 
     def _save_state(self):
@@ -222,10 +162,7 @@ class Plugin(BasePlugin):
 
     @staticmethod
     def _human_size(num_bytes: int) -> str:
-        try:
-            num = float(num_bytes)
-        except Exception:
-            return "0 B"
+        num = float(num_bytes or 0)
         units = ["B", "KiB", "MiB", "GiB", "TiB"]
         for unit in units:
             if num < 1024.0 or unit == units[-1]:
@@ -332,19 +269,13 @@ class Plugin(BasePlugin):
     @staticmethod
     def _file_extension(filename: str) -> str:
         name = str(filename or "")
-        if "." not in name:
-            return ""
-        return name.rsplit(".", 1)[-1].strip().lower()
-
-    @staticmethod
-    def _format_label(ext: str) -> str:
-        return ext.upper() if ext else "unknown"
+        return name.rsplit(".", 1)[-1].strip().lower() if "." in name else ""
 
     def _format_summary(self, counts: dict[str, int]) -> str:
         if not counts:
             return "unknown audio"
         ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        labels = [self._format_label(ext) for ext, _count in ranked[:2]]
+        labels = [ext.upper() if ext else "unknown" for ext, _count in ranked[:2]]
         return labels[0] if len(labels) == 1 else " + ".join(labels)
 
     def _summarize_search_rows(self, rows, *, offset: int = 0, limit: int | None = None) -> tuple[list[dict], int]:
@@ -691,10 +622,7 @@ class Plugin(BasePlugin):
         with self._lock:
             queue = self._pending.get(key)
             if queue and request_id in queue:
-                try:
-                    queue.remove(request_id)
-                except ValueError:
-                    pass
+                queue.remove(request_id)
                 if not queue:
                     self._pending.pop(key, None)
             if self._active.get(key) == request_id:
@@ -717,26 +645,16 @@ class Plugin(BasePlugin):
         path_token = str(path_contains or "").strip().lower()
         if not user_token and not path_token:
             return {"ok": False, "error": "provide user and/or path_contains"}
-        entries = self._queue_entries()
-        matched = []
-        for entry in entries:
-            entry_user = str(entry.get("user") or "")
-            entry_path = str(entry.get("path") or "")
-            if user_token and entry_user.lower() != user_token:
-                continue
-            if path_token and path_token not in entry_path.lower():
-                continue
-            matched.append(entry)
+        matched = [
+            entry for entry in self._queue_entries()
+            if (not user_token or str(entry.get("user") or "").lower() == user_token)
+            and (not path_token or path_token in str(entry.get("path") or "").lower())
+        ]
         if not matched:
             target = user or path_contains
             return {"ok": False, "error": f"no queued downloads matched: {target}"}
         removed = [self._remove_entry(entry, reason="Bulk removed from queue") for entry in matched]
-        summary_bits = []
-        if user_token:
-            summary_bits.append(f"user={user}")
-        if path_token:
-            summary_bits.append(f"path~={path_contains}")
-        summary = ", ".join(summary_bits)
+        summary = ", ".join(bit for bit in (f"user={user}" if user_token else "", f"path~={path_contains}" if path_token else "") if bit)
         return {"ok": True, "removed": removed, "message": f"Removed {len(removed)} queue item(s) matching {summary}"}
 
     def _start_server(self):
@@ -744,8 +662,7 @@ class Plugin(BasePlugin):
             return
         self._stop.clear()
         try:
-            if self.socket_path.exists():
-                self.socket_path.unlink()
+            self.socket_path.unlink(missing_ok=True)
         except Exception:
             pass
         self._server_thread = threading.Thread(target=self._serve, name="DiscordBridgeSocket", daemon=True)
@@ -838,11 +755,7 @@ class Plugin(BasePlugin):
         finally:
             try:
                 server.close()
-            except Exception:
-                pass
-            try:
-                if self.socket_path.exists():
-                    self.socket_path.unlink()
+                self.socket_path.unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -908,7 +821,7 @@ class Plugin(BasePlugin):
             rows = list(getattr(page, "all_data", []) or []) if page else []
             offset = self._safe_int(request.get("offset"), 0)
             requested_limit = request.get("limit")
-            limit = self._safe_int(requested_limit, self._results_limit()) if requested_limit not in (None, "") else self._results_limit()
+            limit = self._safe_int(requested_limit, self._setting_limit("results_limit", 5)) if requested_limit not in (None, "") else self._setting_limit("results_limit", 5)
             limit = max(1, min(100, limit))
             results, total = self._summarize_search_rows(rows, offset=offset, limit=limit)
             return {
@@ -1049,10 +962,7 @@ class Plugin(BasePlugin):
                     if queue and queue[0] == request_id:
                         queue.popleft()
                     elif request_id in queue:
-                        try:
-                            queue.remove(request_id)
-                        except ValueError:
-                            pass
+                        queue.remove(request_id)
                     if not queue:
                         self._pending.pop(key, None)
                     self._save_state()
@@ -1113,12 +1023,8 @@ class Plugin(BasePlugin):
         try:
             if self._server_socket:
                 self._server_socket.close()
+            self.socket_path.unlink(missing_ok=True)
         except Exception:
             pass
         self._server_socket = None
-        try:
-            if self.socket_path.exists():
-                self.socket_path.unlink()
-        except Exception:
-            pass
         self._save_state()
