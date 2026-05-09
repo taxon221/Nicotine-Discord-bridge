@@ -422,18 +422,41 @@ class Plugin(BasePlugin):
             "files": self._browse_files_for_folder(shares, session["folder"]),
         }
 
-    def _queue_file(self, user: str, virtual_path: str, dest: str = "", request_id: str | None = None) -> str:
+    def _queue_file(
+        self,
+        user: str,
+        virtual_path: str,
+        dest: str = "",
+        request_id: str | None = None,
+        request_group_id: str = "",
+    ) -> str:
         request_id = (request_id or str(uuid.uuid4())).strip()
         key = self._key(user, virtual_path)
         with self._lock:
             self._pending[key].append(request_id)
             self._save_state()
         self.core.transfers.get_file(user, virtual_path, dest)
-        self._append_event({"event": "queued", "request_id": request_id, "user": user, "path": virtual_path, "dest": dest})
+        payload = {"event": "queued", "request_id": request_id, "user": user, "path": virtual_path, "dest": dest}
+        if request_group_id:
+            payload["request_group_id"] = request_group_id
+        self._append_event(payload)
         return request_id
 
-    def _queue_entry(self, user: str, virtual_path: str, dest: str = "", request_id: str | None = None) -> dict:
-        request_id = self._queue_file(user, virtual_path, dest=dest, request_id=request_id)
+    def _queue_entry(
+        self,
+        user: str,
+        virtual_path: str,
+        dest: str = "",
+        request_id: str | None = None,
+        request_group_id: str = "",
+    ) -> dict:
+        request_id = self._queue_file(
+            user,
+            virtual_path,
+            dest=dest,
+            request_id=request_id,
+            request_group_id=request_group_id,
+        )
         return {"request_id": request_id, "user": user, "path": virtual_path, "dest": dest}
 
     def _retry_download(self, user: str, virtual_path: str, dest: str = "", request_id: str | None = None) -> dict:
@@ -480,31 +503,32 @@ class Plugin(BasePlugin):
         })
         return request_id
 
-    def _discover_folder_download_transfers(self, transfers) -> None:
+    def _discover_folder_download_browse_sessions(self) -> None:
         now = time.monotonic()
         for request_group_id, session in list(self._folder_download_sessions.items()):
             user = str(session.get("user") or "")
             folder = str(session.get("folder") or "")
             dest = str(session.get("dest") or "")
             known_paths = session.setdefault("known_paths", set())
-            desired_dest = self._folder_download_dest(user, folder, root_folder=folder, dest=dest)
-            matched = False
-            for download in list(transfers):
-                download_user = str(getattr(download, "user", "") or "")
-                virtual_path = str(getattr(download, "filename", "") or "")
-                if download_user != user or not self._virtual_path_in_folder(virtual_path, folder):
-                    continue
-                matched = True
-                if getattr(download, "path", "") != desired_dest:
-                    try:
-                        download.path = desired_dest
-                    except Exception:
-                        pass
-                if virtual_path in known_paths:
-                    continue
-                known_paths.add(virtual_path)
-                self._track_existing_transfer(request_group_id, user, virtual_path, dest=desired_dest)
-            if matched:
+            page = self._browse_page(user)
+            shares = getattr(page, "shares", None) if page is not None else None
+            if shares:
+                for item in self._iter_share_files(shares, folder=folder, recursive=False):
+                    virtual_path = item["fullpath"]
+                    if virtual_path in known_paths:
+                        continue
+                    known_paths.add(virtual_path)
+                    item_dest = self._folder_download_dest(user, item["folder"], root_folder=folder, dest=dest)
+                    self._queue_entry(
+                        user,
+                        virtual_path,
+                        dest=item_dest,
+                        request_group_id=request_group_id,
+                    )
+                session["last_seen"] = now
+                session["browse_completed"] = True
+                continue
+            if page is not None:
                 session["last_seen"] = now
                 continue
             if now - float(session.get("last_seen") or now) > 900:
@@ -683,7 +707,7 @@ class Plugin(BasePlugin):
 
     def _poll_download_progress(self):
         transfers = getattr(getattr(self.core, "transfers", None), "downloads", None) or []
-        self._discover_folder_download_transfers(transfers)
+        self._discover_folder_download_browse_sessions()
         for download in list(transfers):
             user = str(getattr(download, "user", "") or "")
             virtual_path = str(getattr(download, "filename", "") or "")
@@ -904,7 +928,7 @@ class Plugin(BasePlugin):
                 if not fullpath or fullpath in known_paths:
                     continue
                 known_paths.add(fullpath)
-                queued.append(self._queue_entry(user, fullpath, dest=folder_dest))
+                queued.append(self._queue_entry(user, fullpath, dest=folder_dest, request_group_id=request_group_id))
             self._folder_download_sessions[request_group_id] = {
                 "user": user,
                 "folder": folder,
@@ -912,7 +936,7 @@ class Plugin(BasePlugin):
                 "known_paths": known_paths,
                 "last_seen": time.monotonic(),
             }
-            self.core.transfers.get_folder(user, folder)
+            self.core.userbrowse.browse_user(user, path=folder or None, new_request=True, switch_page=False)
             return {
                 "ok": True,
                 "queued": len(queued),
