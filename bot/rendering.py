@@ -48,6 +48,25 @@ def batch_completed_count(batch: DownloadBatch) -> int:
     return sum(1 for request_id in batch.request_ids if batch.items.get(request_id) and batch.items[request_id].status == "finished")
 
 
+def is_unshared_download_error(error: str) -> bool:
+    text = str(error or "").strip().lower()
+    return "file not shared" in text or "not shared" in text
+
+
+def batch_failed_counts(batch: DownloadBatch) -> tuple[int, int]:
+    retryable = 0
+    unshared = 0
+    for request_id in batch.request_ids:
+        item = batch.items.get(request_id)
+        if not item or item.status != "error":
+            continue
+        if is_unshared_download_error(item.error):
+            unshared += 1
+        else:
+            retryable += 1
+    return retryable, unshared
+
+
 def progress_markers(percent: int) -> str:
     return " ".join(f"{'●' if percent >= threshold else '○'}{threshold}" for threshold in (0, 25, 50, 75, 100))
 
@@ -63,6 +82,8 @@ def active_batch_item(batch: DownloadBatch) -> tuple[int, DownloadItem | None]:
 
 
 def current_item_heading(item: DownloadItem) -> str:
+    if item.status == "error" and is_unshared_download_error(item.error):
+        return "Unavailable from source"
     return {
         "finished": "Done",
         "error": "Failed",
@@ -91,26 +112,34 @@ def final_batch_message(batch: DownloadBatch, *, failed: int) -> str:
 def render_batch_message(batch: DownloadBatch) -> str:
     percent = batch_percent(batch)
     done = batch_completed_count(batch)
-    failed = sum(1 for request_id in batch.request_ids if batch.items.get(request_id) and batch.items[request_id].status == "error")
+    retryable_failed, unshared_failed = batch_failed_counts(batch)
+    failed = retryable_failed + unshared_failed
     if done >= batch.total_files and failed == 0:
         return final_batch_message(batch, failed=failed)
     title = "Download complete" if percent >= 100 and done >= batch.total_files else "Download progress"
+    failure_bits = []
+    if retryable_failed:
+        failure_bits.append(f"{retryable_failed} failed")
+    if unshared_failed:
+        failure_bits.append(f"{unshared_failed} unavailable")
     lines = [
         f"{title}: `{trim(batch.query, 140)}`",
         f"Overall: {percent}%",
-        f"Files: {done}/{batch.total_files} finished" + (f" • {failed} failed" if failed else ""),
+        f"Files: {done}/{batch.total_files} finished" + (f" • {' • '.join(failure_bits)}" if failure_bits else ""),
     ]
     current_index, current_item = active_batch_item(batch)
     if current_item is not None:
         label = trim(current_item.label or download_file_label(current_item.path), 100)
         lines.append(f"{current_item_heading(current_item)}: {current_index}/{batch.total_files} `{label}`")
         lines.append(f"Track: [{progress_markers(item_progress(current_item))}]")
-        if current_item.status == "error" and current_item.error:
+        if current_item.status == "error" and current_item.error and not is_unshared_download_error(current_item.error):
             lines.append(f"Error: {trim(current_item.error, 140)}")
     if batch.latest and (current_item is None or current_item.status != "error"):
         lines.append(f"Latest: {trim(batch.latest, 180)}")
-    if failed:
+    if retryable_failed:
         lines.append("Use Retry failed on the message to requeue failed tracks.")
+    if unshared_failed:
+        lines.append("That source no longer shares the file. Use Find another source to search again.")
     return fit_discord_content("\n".join(lines))
 
 

@@ -77,6 +77,7 @@ guild_obj = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 BATCH_EDIT_COOLDOWN_SECONDS = 8.0
 SEARCH_RESULTS_FETCH_LIMIT = 100
 BROWSE_RETRY_DELAY_SECONDS = 300.0
+UNSHARED_ERROR_MARKERS = ("file not shared", "not shared")
 batch_last_edit_at: dict[str, float] = {}
 dirty_batches: set[str] = set()
 upload_alerts: dict[str, UploadAlert] = {}
@@ -162,6 +163,31 @@ async def register_reply(reply: dict[str, Any], interaction: discord.Interaction
     if batch_id:
         await ensure_batch_message(batch_id)
     return batch_id
+
+
+def is_unshared_download_error(error: str) -> bool:
+    text = str(error or "").strip().lower()
+    return any(marker in text for marker in UNSHARED_ERROR_MARKERS)
+
+
+def retryable_failed_items(batch: DownloadBatch) -> list[tuple[str, DownloadItem]]:
+    return [
+        (request_id, item)
+        for request_id in batch.request_ids
+        if (item := batch.items.get(request_id))
+        and item.status == "error"
+        and not is_unshared_download_error(item.error)
+    ]
+
+
+def unshared_failed_items(batch: DownloadBatch) -> list[tuple[str, DownloadItem]]:
+    return [
+        (request_id, item)
+        for request_id in batch.request_ids
+        if (item := batch.items.get(request_id))
+        and item.status == "error"
+        and is_unshared_download_error(item.error)
+    ]
 
 
 def remove_batch_group_mappings(batch_id: str) -> None:
@@ -291,26 +317,79 @@ async def upsert_message(channel_id: int, message_id: int, text: str, view: disc
     return message_id if message_id and await edit_message(channel_id, message_id, text, view=view) else await send_message_with_id(channel_id, text, view=view)
 
 
+async def start_album_search(interaction: discord.Interaction, query: str) -> None:
+    request_id = str(uuid.uuid4())
+    reply = await bridge_call({"op": "search", "request_id": request_id, "query": query})
+    if not reply.get("ok"):
+        await safe_edit(interaction, content=f"Search failed: {reply}", view=None)
+        return
+    search = await poll_bridge(
+        "search_results",
+        reply["request_id"],
+        ready_when=lambda item: item.get("ok") and bool(item.get("results")),
+        timeout=35.0,
+        interval=2.0,
+    )
+    if not search.get("ok") or not (search.get("results") or []):
+        await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
+        return
+    full_search = await bridge_call({"op": "search_results", "request_id": reply["request_id"], "offset": 0, "limit": SEARCH_RESULTS_FETCH_LIMIT})
+    results = full_search.get("results") or search.get("results") or []
+    if not full_search.get("ok") or not results:
+        await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
+        return
+    session = {"query": query, "search_request_id": reply["request_id"], "results": results, "page": 0}
+    await safe_edit(
+        interaction,
+        content=render_search_results_page(query, results, 0),
+        view=SearchResultsView(session, results, page=0),
+    )
+
+
 class RetryFailedDownloadsView(discord.ui.View):
     def __init__(self, batch_id: str):
         super().__init__(timeout=None)
         self.batch_id = batch_id
-        button = discord.ui.Button(
-            label="Retry failed",
-            style=discord.ButtonStyle.blurple,
-            custom_id=f"retry_failed:{batch_id}",
-        )
-        button.callback = self.retry_failed
-        self.add_item(button)
+        batch = state.batches.get(batch_id)
+        has_retryable = bool(batch and retryable_failed_items(batch))
+        has_unshared = bool(batch and unshared_failed_items(batch))
+        if has_retryable:
+            button = discord.ui.Button(
+                label="Retry failed",
+                style=discord.ButtonStyle.blurple,
+                custom_id=f"retry_failed:{batch_id}",
+            )
+            button.callback = self.retry_failed
+            self.add_item(button)
+        if has_unshared:
+            button = discord.ui.Button(
+                label="Find another source",
+                style=discord.ButtonStyle.green,
+                custom_id=f"find_another_source:{batch_id}",
+            )
+            button.callback = self.find_another_source
+            self.add_item(button)
+
+    async def find_another_source(self, interaction: discord.Interaction):
+        batch = state.batches.get(self.batch_id)
+        if batch is None:
+            await safe_send(interaction, content="That download batch is no longer active.", ephemeral=True)
+            return
+        query = str(batch.query or "").split(" :: ", 1)[0].strip()
+        if not query:
+            await safe_send(interaction, content="I don't have the original search text for that batch anymore.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await start_album_search(interaction, query)
 
     async def retry_failed(self, interaction: discord.Interaction):
         batch = state.batches.get(self.batch_id)
         if batch is None:
             await safe_send(interaction, content="That download batch is no longer active.", ephemeral=True)
             return
-        failed_items = [(request_id, item) for request_id in batch.request_ids if (item := batch.items.get(request_id)) and item.status == "error"]
+        failed_items = retryable_failed_items(batch)
         if not failed_items:
-            await safe_send(interaction, content="There are no failed tracks to retry right now.", ephemeral=True)
+            await safe_send(interaction, content="That failure is from a source that does not share the file anymore. Use Find another source instead.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         retried = 0
@@ -686,32 +765,7 @@ async def slsk_ping(interaction: discord.Interaction):
 @app_commands.describe(query="Album / artist / folder search text")
 async def slsk_album(interaction: discord.Interaction, query: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    request_id = str(uuid.uuid4())
-    reply = await bridge_call({"op": "search", "request_id": request_id, "query": query})
-    if not reply.get("ok"):
-        await safe_edit(interaction, content=f"Search failed: {reply}", view=None)
-        return
-    search = await poll_bridge(
-        "search_results",
-        reply["request_id"],
-        ready_when=lambda item: item.get("ok") and bool(item.get("results")),
-        timeout=35.0,
-        interval=2.0,
-    )
-    if not search.get("ok") or not (search.get("results") or []):
-        await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
-        return
-    full_search = await bridge_call({"op": "search_results", "request_id": reply["request_id"], "offset": 0, "limit": SEARCH_RESULTS_FETCH_LIMIT})
-    results = full_search.get("results") or search.get("results") or []
-    if not full_search.get("ok") or not results:
-        await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
-        return
-    session = {"query": query, "search_request_id": reply["request_id"], "results": results, "page": 0}
-    await safe_edit(
-        interaction,
-        content=render_search_results_page(query, results, 0),
-        view=SearchResultsView(session, results, page=0),
-    )
+    await start_album_search(interaction, query)
 
 
 @slsk.command(name="download", description="Queue an exact Soulseek username + path download")
