@@ -78,7 +78,10 @@ BATCH_EDIT_COOLDOWN_SECONDS = 8.0
 SEARCH_RESULTS_FETCH_LIMIT = 100
 BROWSE_RETRY_DELAY_SECONDS = 300.0
 RECONCILE_INTERVAL_SECONDS = 60.0
-UNSHARED_ERROR_MARKERS = ("file not shared", "not shared")
+SEARCH_POLL_INTERVAL_SECONDS = 2.0
+SEARCH_EMPTY_GRACE_SECONDS = 35.0
+SEARCH_SLOW_RETRY_SECONDS = 90.0
+UNSHARED_ERROR_MARKERS = ("file not shared", "not shared", "banned")
 TERMINAL_QUEUE_STATUSES = {"finished", "cancelled", "canceled", "aborted", "failed", "error", "file not shared", "not shared", "removed"}
 batch_last_edit_at: dict[str, float] = {}
 dirty_batches: set[str] = set()
@@ -326,20 +329,36 @@ async def start_album_search(interaction: discord.Interaction, query: str) -> No
     if not reply.get("ok"):
         await safe_edit(interaction, content=f"Search failed: {reply}", view=None)
         return
-    search = await poll_bridge(
-        "search_results",
-        reply["request_id"],
-        ready_when=lambda item: item.get("ok") and bool(item.get("results")),
-        timeout=35.0,
-        interval=2.0,
-    )
-    if not search.get("ok") or not (search.get("results") or []):
-        await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
+    search = {"ok": False, "error": "timed out"}
+    deadline = time.monotonic() + SEARCH_SLOW_RETRY_SECONDS
+    slow_notice_sent = False
+    while time.monotonic() < deadline:
+        search = await bridge_call({"op": "search_results", "request_id": reply["request_id"]})
+        if not search.get("ok"):
+            break
+        if search.get("results"):
+            break
+        elapsed = SEARCH_SLOW_RETRY_SECONDS - max(0.0, deadline - time.monotonic())
+        if search.get("ready") and elapsed >= SEARCH_EMPTY_GRACE_SECONDS:
+            await safe_edit(interaction, content=f"No results found for `{query}` after {int(SEARCH_EMPTY_GRACE_SECONDS)} seconds.", view=None)
+            return
+        if not slow_notice_sent and elapsed >= SEARCH_EMPTY_GRACE_SECONDS:
+            await safe_edit(interaction, content=f"Search for `{query}` is still loading; I'll keep checking automatically for another minute.", view=None)
+            slow_notice_sent = True
+        await asyncio.sleep(SEARCH_POLL_INTERVAL_SECONDS)
+    if not search.get("ok"):
+        await safe_edit(interaction, content=f"Search failed: {search}", view=None)
+        return
+    if not (search.get("results") or []):
+        if search.get("ready"):
+            await safe_edit(interaction, content=f"No results found for `{query}` after {int(SEARCH_EMPTY_GRACE_SECONDS)} seconds.", view=None)
+        else:
+            await safe_edit(interaction, content=f"Search for `{query}` is still not returning data after automatic retries. Soulseek/Nicotine may be slow right now; try again later.", view=None)
         return
     full_search = await bridge_call({"op": "search_results", "request_id": reply["request_id"], "offset": 0, "limit": SEARCH_RESULTS_FETCH_LIMIT})
     results = full_search.get("results") or search.get("results") or []
     if not full_search.get("ok") or not results:
-        await safe_edit(interaction, content=f"No useful results found for `{query}` yet. If the remote library is slow, try the same search again in a bit.", view=None)
+        await safe_edit(interaction, content=f"No results found for `{query}` after {int(SEARCH_EMPTY_GRACE_SECONDS)} seconds.", view=None)
         return
     session = {"query": query, "search_request_id": reply["request_id"], "results": results, "page": 0}
     await safe_edit(
