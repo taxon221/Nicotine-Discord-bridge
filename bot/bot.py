@@ -9,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import discord
 from discord import app_commands
@@ -89,6 +90,7 @@ upload_alerts: dict[str, UploadAlert] = {}
 upload_alert_last_edit_at: dict[str, float] = {}
 dirty_upload_alerts: set[str] = set()
 last_reconcile_at = 0.0
+announcement_views_registered = False
 
 
 async def bridge_call(payload: dict[str, Any]) -> dict[str, Any]:
@@ -210,6 +212,28 @@ async def safe_send(interaction: discord.Interaction, *, content: str, ephemeral
     await interaction.response.send_message(fit_discord_content(content), ephemeral=ephemeral)
 
 
+def bandcamp_query_from_title(title: str) -> str:
+    text = str(title or "").replace("“", '"').replace("”", '"').strip()
+    if "," in text and '"' in text:
+        artist, rest = text.split(",", 1)
+        rest = rest.strip()
+        if rest.startswith('"') and rest.endswith('"') and len(rest) > 2:
+            album = rest.strip('"').strip()
+            return f"{artist.strip()} {album}".strip()
+    return text
+
+
+def pitchfork_query_from_link(title: str, link: str) -> str:
+    slug = ""
+    try:
+        parts = [part for part in urlsplit(str(link or "")).path.split("/") if part]
+        if parts:
+            slug = parts[-1].replace("-", " ").strip()
+    except Exception:
+        slug = ""
+    return slug or str(title or "").strip()
+
+
 async def ensure_upload_alert_message(alert_id: str, *, force: bool = False):
     alert = upload_alerts.get(alert_id)
     if alert is None:
@@ -233,6 +257,73 @@ async def ensure_upload_alert_message(alert_id: str, *, force: bool = False):
 async def flush_dirty_upload_alerts():
     for alert_id in list(dirty_upload_alerts):
         await ensure_upload_alert_message(alert_id, force=True)
+
+
+class BandcampAotdView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        button = discord.ui.Button(label="Download in Nicotine", style=discord.ButtonStyle.green, custom_id="bandcamp_aotd:download")
+
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            content = str(getattr(interaction.message, "content", "") or "")
+            lines = [line.strip() for line in content.splitlines() if line.strip()]
+            title = lines[1] if len(lines) > 1 else ""
+            query = bandcamp_query_from_title(title)
+            await start_album_search(interaction, query)
+
+        button.callback = callback
+        self.add_item(button)
+
+
+class PitchforkBestNewAlbumView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        button = discord.ui.Button(label="Download in Nicotine", style=discord.ButtonStyle.green, custom_id="pitchfork_best_new_album:download")
+
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            content = str(getattr(interaction.message, "content", "") or "")
+            lines = [line.strip() for line in content.splitlines() if line.strip()]
+            title = lines[1] if len(lines) > 1 else ""
+            link = lines[2] if len(lines) > 2 else ""
+            query = pitchfork_query_from_link(title, link)
+            await start_album_search(interaction, query)
+
+        button.callback = callback
+        self.add_item(button)
+
+
+async def send_bandcamp_aotd_message(channel_id: int, title: str, link: str) -> None:
+    channel = await get_channel(channel_id)
+    if channel is None:
+        return
+    view = BandcampAotdView()
+    message = (
+        "Bandcamp Album of the Day\n"
+        f"{title}\n"
+        f"{link}"
+    )
+    try:
+        await channel.send(fit_discord_content(message), view=view)
+    except Exception:
+        return
+
+
+async def send_pitchfork_best_new_album_message(channel_id: int, title: str, link: str) -> None:
+    channel = await get_channel(channel_id)
+    if channel is None:
+        return
+    view = PitchforkBestNewAlbumView()
+    message = (
+        "Pitchfork Best New Album\n"
+        f"{title}\n"
+        f"{link}"
+    )
+    try:
+        await channel.send(fit_discord_content(message), view=view)
+    except Exception:
+        return
 
 
 async def record_upload_alert_event(event: dict[str, Any]):
@@ -814,12 +905,17 @@ async def setup_hook():
 
 @client.event
 async def on_ready():
+    global announcement_views_registered
+    if not announcement_views_registered:
+        client.add_view(BandcampAotdView())
+        client.add_view(PitchforkBestNewAlbumView())
+        announcement_views_registered = True
     if not watch_bridge_events.is_running():
         watch_bridge_events.start()
+    await reconcile_state_with_bridge(force=True)
     for batch_id, batch in list(state.batches.items()):
         if batch.message_id:
             client.add_view(RetryFailedDownloadsView(batch_id))
-    await reconcile_state_with_bridge(force=True)
     print(f"Logged in as {client.user} | socket={BRIDGE_SOCKET} | events={EVENTS_FILE} | state={STATE_FILE}")
 
 
@@ -947,6 +1043,20 @@ async def watch_bridge_events():
             continue
         kind = event.get("event")
         request_id = event.get("request_id")
+        if kind == "bandcamp_aotd":
+            channel_id = int(event.get("channel_id") or ALERT_CHANNEL_ID or 0)
+            title = str(event.get("title") or "Bandcamp Album of the Day")
+            link = str(event.get("link") or "https://daily.bandcamp.com/album-of-the-day")
+            if channel_id:
+                await send_bandcamp_aotd_message(channel_id, title, link)
+            continue
+        if kind == "pitchfork_best_new_album":
+            channel_id = int(event.get("channel_id") or ALERT_CHANNEL_ID or 0)
+            title = str(event.get("title") or "Pitchfork Best New Album")
+            link = str(event.get("link") or "https://pitchfork.com/feed/reviews/best/albums/rss")
+            if channel_id:
+                await send_pitchfork_best_new_album_message(channel_id, title, link)
+            continue
         if kind in {"upload_started", "upload_finished"}:
             await record_upload_alert_event(event)
             continue
