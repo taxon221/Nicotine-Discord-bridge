@@ -68,6 +68,7 @@ class Plugin(BasePlugin):
     def loaded_notification(self):
         self._ensure_dirs()
         self._load_state()
+        self._prune_stale_state()
         self._write_runtime_manifest()
         self._start_server()
         self._start_progress_watcher()
@@ -144,6 +145,45 @@ class Plugin(BasePlugin):
             self._pending.clear()
             self._pending.update({key: deque(values) for key, values in pending.items()})
             self._active = dict(active)
+
+    @staticmethod
+    def _is_terminal_download_status(status: str) -> bool:
+        return str(status or "").strip().lower() in {
+            "finished",
+            "cancelled",
+            "canceled",
+            "aborted",
+            "failed",
+            "error",
+            "file not shared",
+            "not shared",
+            "removed",
+        }
+
+    def _prune_stale_state(self):
+        stale_keys: list[str] = []
+        with self._lock:
+            keys = list(self._pending.keys())
+        for key in keys:
+            user, virtual_path = self._split_key(key)
+            transfer = self._find_download_transfer(user, virtual_path)
+            status = str(getattr(transfer, "status", "") or "") if transfer is not None else ""
+            if transfer is None or self._is_terminal_download_status(status):
+                stale_keys.append(key)
+        if not stale_keys:
+            return
+        with self._lock:
+            changed = False
+            for key in stale_keys:
+                if key in self._pending:
+                    self._pending.pop(key, None)
+                    changed = True
+                if key in self._active:
+                    self._active.pop(key, None)
+                    changed = True
+            if changed:
+                self._save_state()
+        self.log(f"Discord bridge pruned {len(stale_keys)} stale transfer(s) from persisted state")
 
     def _save_state(self):
         with self._lock:
@@ -575,6 +615,7 @@ class Plugin(BasePlugin):
         return None
 
     def _queue_entries(self) -> list[dict]:
+        self._prune_stale_state()
         with self._lock:
             pending_snapshot = {key: list(values) for key, values in self._pending.items()}
             active_snapshot = dict(self._active)
@@ -981,14 +1022,20 @@ class Plugin(BasePlugin):
         with self._lock:
             if finish:
                 request_id = self._active.pop(key, None)
+                changed = request_id is not None
                 queue = self._pending.get(key)
-                if queue and request_id is not None:
+                if queue and request_id is None:
+                    request_id = queue.popleft()
+                    changed = True
+                elif queue and request_id is not None:
                     if queue and queue[0] == request_id:
                         queue.popleft()
                     elif request_id in queue:
                         queue.remove(request_id)
-                    if not queue:
-                        self._pending.pop(key, None)
+                    changed = True
+                if queue is not None and not queue:
+                    self._pending.pop(key, None)
+                if changed:
                     self._save_state()
                 return request_id
             request_id = self._active.get(key)

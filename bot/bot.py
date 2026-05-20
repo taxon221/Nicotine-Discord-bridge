@@ -77,12 +77,15 @@ guild_obj = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 BATCH_EDIT_COOLDOWN_SECONDS = 8.0
 SEARCH_RESULTS_FETCH_LIMIT = 100
 BROWSE_RETRY_DELAY_SECONDS = 300.0
+RECONCILE_INTERVAL_SECONDS = 60.0
 UNSHARED_ERROR_MARKERS = ("file not shared", "not shared")
+TERMINAL_QUEUE_STATUSES = {"finished", "cancelled", "canceled", "aborted", "failed", "error", "file not shared", "not shared", "removed"}
 batch_last_edit_at: dict[str, float] = {}
 dirty_batches: set[str] = set()
 upload_alerts: dict[str, UploadAlert] = {}
 upload_alert_last_edit_at: dict[str, float] = {}
 dirty_upload_alerts: set[str] = set()
+last_reconcile_at = 0.0
 
 
 async def bridge_call(payload: dict[str, Any]) -> dict[str, Any]:
@@ -500,6 +503,54 @@ async def remove_entries_from_state(entries: list[dict[str, Any]], *, reason: st
             await remove_request_from_state(request_id, reason=reason)
 
 
+async def reconcile_state_with_bridge(*, force: bool = False) -> None:
+    global last_reconcile_at
+    now = time.monotonic()
+    if not force and (now - last_reconcile_at) < RECONCILE_INTERVAL_SECONDS:
+        return
+    last_reconcile_at = now
+    reply = await bridge_call({"op": "queue_list"})
+    if not reply.get("ok"):
+        return
+    entries = reply.get("entries") or []
+    live_request_ids = {
+        str(entry.get("request_id") or "").strip()
+        for entry in entries
+        if str(entry.get("request_id") or "").strip()
+        and str(entry.get("status") or "").strip().lower() not in TERMINAL_QUEUE_STATUSES
+    }
+    stale_request_ids = [request_id for request_id in list(state.pending) if request_id not in live_request_ids]
+    if not stale_request_ids:
+        return
+    touched_batches: set[str] = set()
+    emptied_batches: list[tuple[int, int]] = []
+    for request_id in stale_request_ids:
+        pending = state.pending.pop(request_id, None)
+        if pending is None:
+            continue
+        batch_id = pending.batch_id
+        batch = state.batches.get(batch_id)
+        if batch is None:
+            continue
+        batch.items.pop(request_id, None)
+        batch.request_ids = [value for value in batch.request_ids if value != request_id]
+        batch.total_files = len(batch.request_ids)
+        touched_batches.add(batch_id)
+        if not batch.request_ids:
+            emptied_batches.append((batch.channel_id, batch.message_id))
+            state.batches.pop(batch_id, None)
+            remove_batch_group_mappings(batch_id)
+            dirty_batches.discard(batch_id)
+            batch_last_edit_at.pop(batch_id, None)
+    state.save()
+    for batch_id in touched_batches:
+        if batch_id in state.batches:
+            await ensure_batch_message(batch_id, force=True)
+    for channel_id, message_id in emptied_batches:
+        if message_id:
+            await edit_message(channel_id, message_id, "Download queue cleared.", view=None)
+
+
 class SearchResultSelect(discord.ui.Select):
     def __init__(self, results: list[dict[str, Any]], page: int):
         start = page * RESULT_PAGE_SIZE
@@ -749,6 +800,7 @@ async def on_ready():
     for batch_id, batch in list(state.batches.items()):
         if batch.message_id:
             client.add_view(RetryFailedDownloadsView(batch_id))
+    await reconcile_state_with_bridge(force=True)
     print(f"Logged in as {client.user} | socket={BRIDGE_SOCKET} | events={EVENTS_FILE} | state={STATE_FILE}")
 
 
@@ -955,6 +1007,7 @@ async def watch_bridge_events():
         state.save()
     await flush_dirty_batch_updates()
     await flush_dirty_upload_alerts()
+    await reconcile_state_with_bridge()
 
 
 if __name__ == "__main__":
