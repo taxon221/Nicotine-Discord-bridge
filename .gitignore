@@ -1,4 +1,5 @@
 /.env
 /bot/.env
+/bot/local_extensions/
 __pycache__/
 *.py[cod]

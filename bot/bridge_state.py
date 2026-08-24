@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,21 @@ def read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def read_event_lines(path: Path, cursor: int) -> tuple[list[str], int, bool]:
+    """Read complete JSONL records and recover if the file was rotated."""
+    with path.open("rb") as handle:
+        size = os.fstat(handle.fileno()).st_size
+        reset = cursor < 0 or cursor > size
+        start = 0 if reset else cursor
+        handle.seek(start)
+        data = handle.read()
+    complete_end = data.rfind(b"\n") + 1
+    if complete_end <= 0:
+        return [], start, reset
+    complete = data[:complete_end]
+    return [raw.decode("utf-8", errors="replace") for raw in complete.splitlines(keepends=True)], start + complete_end, reset
 
 
 @dataclass
@@ -44,6 +60,30 @@ class DownloadBatch:
     items: dict[str, DownloadItem] = field(default_factory=dict)
     message_id: int = 0
     latest: str = ""
+
+
+def heal_downloads_present_on_disk(batches: dict[str, DownloadBatch]) -> set[str]:
+    """Mark errored downloads complete when their destination file is present."""
+    healed: set[str] = set()
+    for batch_id, batch in batches.items():
+        changed = False
+        for item in batch.items.values():
+            if str(item.status or "").lower() != "error" or not item.dest or not item.label:
+                continue
+            if (Path(item.dest).expanduser() / item.label).exists():
+                item.status = "finished"
+                item.progress = 100
+                item.error = ""
+                changed = True
+        if not changed:
+            continue
+        healed.add(batch_id)
+        if batch.request_ids and all(
+            (item := batch.items.get(request_id)) is not None and str(item.status or "").lower() == "finished"
+            for request_id in batch.request_ids
+        ):
+            batch.latest = f"Finished {len(batch.request_ids)}/{len(batch.request_ids)}"
+    return healed
 
 
 @dataclass
@@ -87,15 +127,15 @@ class BridgeState:
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(
-                {
-                    "cursor": self.cursor,
-                    "pending": {key: asdict(value) for key, value in self.pending.items()},
-                    "download_groups": dict(self.download_groups),
-                    "batches": {key: asdict(value) for key, value in self.batches.items()},
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        payload = {
+            "cursor": self.cursor,
+            "pending": {key: asdict(value) for key, value in self.pending.items()},
+            "download_groups": dict(self.download_groups),
+            "batches": {key: asdict(value) for key, value in self.batches.items()},
+        }
+        temp_path = self.path.with_name(self.path.name + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, self.path)

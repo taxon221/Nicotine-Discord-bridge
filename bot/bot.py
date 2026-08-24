@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
-import socket
 import time
 import uuid
 from pathlib import Path
@@ -15,7 +15,8 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from bridge_state import BridgeState, DownloadBatch, DownloadItem, PendingRequest, UploadAlert, read_json
+from bridge_state import BridgeState, DownloadBatch, DownloadItem, PendingRequest, UploadAlert, heal_downloads_present_on_disk, read_event_lines, read_json
+from bridge_transport import unix_json_call
 from rendering import (
     RESULT_PAGE_SIZE,
     artist_album_text,
@@ -79,6 +80,7 @@ BATCH_EDIT_COOLDOWN_SECONDS = 8.0
 SEARCH_RESULTS_FETCH_LIMIT = 100
 BROWSE_RETRY_DELAY_SECONDS = 300.0
 RECONCILE_INTERVAL_SECONDS = 60.0
+BRIDGE_CALL_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("NICOTINE_BRIDGE_TIMEOUT", "8") or 8))
 SEARCH_POLL_INTERVAL_SECONDS = 2.0
 SEARCH_EMPTY_GRACE_SECONDS = 35.0
 SEARCH_SLOW_RETRY_SECONDS = 90.0
@@ -94,24 +96,12 @@ announcement_views_registered = False
 
 
 async def bridge_call(payload: dict[str, Any]) -> dict[str, Any]:
-    if not BRIDGE_SOCKET.exists():
-        return {"ok": False, "error": f"bridge socket not found: {BRIDGE_SOCKET}"}
-
-    def run_call():
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(str(BRIDGE_SOCKET))
-            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-            sock.shutdown(socket.SHUT_WR)
-            chunks: list[bytes] = []
-            while True:
-                data = sock.recv(65536)
-                if not data:
-                    break
-                chunks.append(data)
-            raw = b"".join(chunks).decode("utf-8").strip()
-            return json.loads(raw) if raw else {"ok": False, "error": "empty response from bridge"}
-
-    return await asyncio.to_thread(run_call)
+    return await asyncio.to_thread(
+        unix_json_call,
+        BRIDGE_SOCKET,
+        payload,
+        timeout=BRIDGE_CALL_TIMEOUT_SECONDS,
+    )
 
 
 async def poll_bridge(op: str, request_id: str, *, ready_when, timeout: float, interval: float) -> dict[str, Any]:
@@ -255,8 +245,15 @@ async def ensure_upload_alert_message(alert_id: str, *, force: bool = False):
 
 
 async def flush_dirty_upload_alerts():
+    now = time.monotonic()
     for alert_id in list(dirty_upload_alerts):
-        await ensure_upload_alert_message(alert_id, force=True)
+        alert = upload_alerts.get(alert_id)
+        if alert is None:
+            dirty_upload_alerts.discard(alert_id)
+            upload_alert_last_edit_at.pop(alert_id, None)
+            continue
+        if not alert.message_id or (now - upload_alert_last_edit_at.get(alert_id, 0.0)) >= BATCH_EDIT_COOLDOWN_SECONDS:
+            await ensure_upload_alert_message(alert_id, force=True)
 
 
 class BandcampAotdView(discord.ui.View):
@@ -630,8 +627,6 @@ async def reconcile_state_with_bridge(*, force: bool = False) -> None:
         and str(entry.get("status") or "").strip().lower() not in TERMINAL_QUEUE_STATUSES
     }
     stale_request_ids = [request_id for request_id in list(state.pending) if request_id not in live_request_ids]
-    if not stale_request_ids:
-        return
     touched_batches: set[str] = set()
     emptied_batches: list[tuple[int, int]] = []
     for request_id in stale_request_ids:
@@ -652,8 +647,10 @@ async def reconcile_state_with_bridge(*, force: bool = False) -> None:
             remove_batch_group_mappings(batch_id)
             dirty_batches.discard(batch_id)
             batch_last_edit_at.pop(batch_id, None)
-    state.save()
-    for batch_id in touched_batches:
+    healed_batches = heal_downloads_present_on_disk(state.batches)
+    if stale_request_ids or healed_batches:
+        state.save()
+    for batch_id in touched_batches | healed_batches:
         if batch_id in state.batches:
             await ensure_batch_message(batch_id, force=True)
     for channel_id, message_id in emptied_batches:
@@ -922,10 +919,44 @@ async def on_ready():
 slsk = app_commands.Group(name="slsk", description="Soulseek / Nicotine bridge commands")
 
 
+async def bridge_status_text() -> str:
+    started = time.monotonic()
+    reply = await bridge_call({"op": "status"})
+    latency_ms = max(0, round((time.monotonic() - started) * 1000))
+    if not reply.get("ok"):
+        if "unknown op" in str(reply.get("error") or "").lower():
+            legacy_ping = await bridge_call({"op": "ping"})
+            if legacy_ping.get("ok"):
+                return (
+                    f"Bridge online ({latency_ms} ms)\n"
+                    "Detailed health is waiting for the Nicotine plugin to be reloaded."
+                )
+        return f"Bridge offline: {reply.get('error') or 'unknown error'}"
+    connected = reply.get("soulseek_connected")
+    connection_text = "connected" if connected is True else "disconnected" if connected is False else "unknown"
+    pending = int(reply.get("pending_requests") or 0)
+    active = int(reply.get("active_requests") or 0)
+    transfers = int(reply.get("download_transfers") or 0)
+    uptime = int(reply.get("uptime_seconds") or 0)
+    return (
+        f"Bridge online ({latency_ms} ms)\n"
+        f"Soulseek: {connection_text}\n"
+        f"Tracked requests: {active} active, {pending} pending\n"
+        f"Nicotine download rows: {transfers}\n"
+        f"Plugin uptime: {uptime // 3600}h {(uptime % 3600) // 60}m"
+    )
+
+
 @slsk.command(name="ping", description="Check that the local Nicotine bridge is alive")
 async def slsk_ping(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await safe_edit(interaction, content=f"Bridge: {await bridge_call({'op': 'ping'})}")
+    await safe_edit(interaction, content=await bridge_status_text())
+
+
+@slsk.command(name="status", description="Show Nicotine, Soulseek, bridge, and queue health")
+async def slsk_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await safe_edit(interaction, content=await bridge_status_text())
 
 
 @slsk.command(name="album", description="Search Soulseek for an album or folder, then choose what to download")
@@ -938,6 +969,7 @@ async def slsk_album(interaction: discord.Interaction, query: str):
 @slsk.command(name="download", description="Queue an exact Soulseek username + path download")
 @app_commands.describe(user="Soulseek username", path="Virtual path inside the user's share", destination="Optional local destination folder")
 async def slsk_download(interaction: discord.Interaction, user: str, path: str, destination: str | None = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     reply = await bridge_call({
         "op": "download",
         "request_id": str(uuid.uuid4()),
@@ -946,10 +978,10 @@ async def slsk_download(interaction: discord.Interaction, user: str, path: str, 
         "dest": destination or "",
     })
     if not reply.get("ok"):
-        await safe_send(interaction, content=f"Failed: {reply}", ephemeral=True)
+        await safe_edit(interaction, content=f"Failed: {reply}", view=None)
         return
     await register_reply(reply, interaction, f"{user} :: {path}")
-    await safe_send(interaction, content=f"Queued exact path download for `{user}` -> `{path}`. Progress will update in-channel.", ephemeral=True)
+    await safe_edit(interaction, content=f"Queued exact path download for `{user}` -> `{path}`. Progress will update in-channel.", view=None)
 
 
 @slsk.command(name="queue", description="Show the current Nicotine bridge download queue")
@@ -1020,20 +1052,57 @@ async def slsk_unqueue(
 tree.add_command(slsk)
 
 
+def load_local_extensions() -> None:
+    extension_dir = Path(__file__).resolve().parent / "local_extensions"
+    if not extension_dir.is_dir():
+        return
+    deps = {
+        "tree": tree,
+        "discord": discord,
+        "app_commands": app_commands,
+        "safe_edit": safe_edit,
+        "safe_send": safe_send,
+        "trim": trim,
+        "fit_discord_content": fit_discord_content,
+    }
+    for path in sorted(extension_dir.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        module_name = f"local_extension_{path.stem}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                print(f"local extension skipped {path.name}: no loader")
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            setup = getattr(module, "setup", None)
+            if callable(setup):
+                setup(deps)
+                print(f"local extension loaded: {path.name}")
+        except Exception as exc:
+            print(f"local extension failed {path.name}: {exc}")
+
+
+load_local_extensions()
+
+
 @tasks.loop(seconds=2.5)
 async def watch_bridge_events():
     if not EVENTS_FILE.exists():
         await flush_dirty_batch_updates()
         await flush_dirty_upload_alerts()
+        await reconcile_state_with_bridge()
         return
     try:
-        with EVENTS_FILE.open("r", encoding="utf-8") as handle:
-            handle.seek(state.cursor)
-            lines = handle.readlines()
-            state.cursor = handle.tell()
-    except Exception:
+        lines, state.cursor, cursor_reset = read_event_lines(EVENTS_FILE, state.cursor)
+        if cursor_reset:
+            print(f"event log rotation detected; cursor reset for {EVENTS_FILE}")
+    except Exception as exc:
+        print(f"event log read failed: {exc}")
         await flush_dirty_batch_updates()
         await flush_dirty_upload_alerts()
+        await reconcile_state_with_bridge()
         return
     touched_batches: dict[str, bool] = {}
     for raw in lines:
