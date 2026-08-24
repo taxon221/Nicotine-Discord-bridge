@@ -38,6 +38,10 @@ SETTING_SPECS = {
 }
 DEFAULT_SETTINGS = {key: default for key, (default, _description, _value_type) in SETTING_SPECS.items()}
 METASETTINGS = {key: {"description": description, "type": value_type} for key, (_default, description, value_type) in SETTING_SPECS.items()}
+MAX_EVENT_LOG_BYTES = 5 * 1024 * 1024
+MAX_REQUEST_BYTES = 1024 * 1024
+CLIENT_READ_TIMEOUT_SECONDS = 10.0
+MAIN_THREAD_TIMEOUT_SECONDS = 7.0
 
 
 class Plugin(BasePlugin):
@@ -54,7 +58,12 @@ class Plugin(BasePlugin):
         self.__privatecommands__ = [("bridgeenv", self.open_env_command), ("bridgepaths", self.show_paths_command)]
         self._stop = threading.Event()
         self._server_thread = self._progress_thread = self._server_socket = None
+        self._server_ready = threading.Event()
+        self._server_error = ""
         self._lock = threading.RLock()
+        self._events_lock = threading.Lock()
+        self._started_at = time.monotonic()
+        self._last_progress_error_log = 0.0
         self._pending = defaultdict(deque)
         self._active = {}
         self._progress_marks = {}
@@ -70,9 +79,12 @@ class Plugin(BasePlugin):
         self._load_state()
         self._prune_stale_state()
         self._write_runtime_manifest()
-        self._start_server()
+        server_ready = self._start_server()
         self._start_progress_watcher()
-        self.log(f"Discord bridge ready at {self.socket_path} (events={self.events_path})")
+        if server_ready:
+            self.log(f"Discord bridge ready at {self.socket_path} (events={self.events_path})")
+        else:
+            self.log(f"Discord bridge failed to start at {self.socket_path}: {self._server_error or 'startup timed out'}")
 
     def disable(self):
         self._shutdown()
@@ -115,9 +127,23 @@ class Plugin(BasePlugin):
 
     def _write_runtime_manifest(self):
         try:
-            self.runtime_path.write_text(json.dumps(self._runtime_manifest(), indent=2, ensure_ascii=False), encoding="utf-8")
+            self._atomic_write_json(self.runtime_path, self._runtime_manifest())
         except Exception as exc:
             self.log(f"Discord bridge runtime manifest write failed: {exc}")
+
+    def _atomic_write_json(self, path: Path, payload: dict):
+        temp_path = path.with_name(path.name + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        self._fix_data_file_ownership(path)
+
+    def _fix_data_file_ownership(self, path: Path):
+        owner = self.base_dir.stat()
+        os.chown(path, owner.st_uid, owner.st_gid)
+        os.chmod(path, 0o664)
 
     def open_env_command(self, _source, _args):
         env_path = self._bot_env_path()
@@ -160,6 +186,18 @@ class Plugin(BasePlugin):
             "removed",
         }
 
+    def _download_target_exists(self, transfer, virtual_path: str) -> bool:
+        raw_path = str(getattr(transfer, "path", "") or "").strip()
+        if not raw_path:
+            return False
+        path = Path(raw_path).expanduser()
+        if path.is_file():
+            return True
+        filename = self._split_virtual_path(virtual_path)[-1]
+        if not filename:
+            return False
+        return (path / filename).exists()
+
     def _prune_stale_state(self):
         stale_keys: list[str] = []
         with self._lock:
@@ -169,6 +207,9 @@ class Plugin(BasePlugin):
             transfer = self._find_download_transfer(user, virtual_path)
             status = str(getattr(transfer, "status", "") or "") if transfer is not None else ""
             if transfer is None or self._is_terminal_download_status(status):
+                stale_keys.append(key)
+                continue
+            if status.strip().lower() != "transferring" and self._download_target_exists(transfer, virtual_path):
                 stale_keys.append(key)
         if not stale_keys:
             return
@@ -192,7 +233,7 @@ class Plugin(BasePlugin):
                 "active": dict(self._active),
             }
         try:
-            self.state_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._atomic_write_json(self.state_path, data)
         except Exception as exc:
             self.log(f"Discord bridge state save failed: {exc}")
 
@@ -217,11 +258,19 @@ class Plugin(BasePlugin):
     def _append_event(self, payload: dict):
         payload = dict(payload)
         payload.setdefault("ts", self._now_iso())
-        try:
-            with self.events_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception as exc:
-            self.log(f"Discord bridge event write failed: {exc}")
+        with self._events_lock:
+            try:
+                if self.events_path.exists() and self.events_path.stat().st_size >= MAX_EVENT_LOG_BYTES:
+                    rotated_path = self.events_path.with_suffix(self.events_path.suffix + ".1")
+                    rotated_path.unlink(missing_ok=True)
+                    self.events_path.replace(rotated_path)
+                created = not self.events_path.exists()
+                with self.events_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                if created:
+                    self._fix_data_file_ownership(self.events_path)
+            except Exception as exc:
+                self.log(f"Discord bridge event write failed: {exc}")
 
     def _search_page(self, token):
         ui = getattr(getattr(self.core, "search", None), "ui_callback", None)
@@ -475,12 +524,27 @@ class Plugin(BasePlugin):
         with self._lock:
             self._pending[key].append(request_id)
             self._save_state()
-        self.core.transfers.get_file(user, virtual_path, dest)
+        try:
+            self.core.transfers.get_file(user, virtual_path, dest)
+        except Exception:
+            self._discard_request_id(key, request_id)
+            raise
         payload = {"event": "queued", "request_id": request_id, "user": user, "path": virtual_path, "dest": dest}
         if request_group_id:
             payload["request_group_id"] = request_group_id
         self._append_event(payload)
         return request_id
+
+    def _discard_request_id(self, key: str, request_id: str) -> None:
+        with self._lock:
+            queue = self._pending.get(key)
+            if queue and request_id in queue:
+                queue.remove(request_id)
+                if not queue:
+                    self._pending.pop(key, None)
+            if self._active.get(key) == request_id:
+                self._active.pop(key, None)
+            self._save_state()
 
     def _queue_entry(
         self,
@@ -516,7 +580,11 @@ class Plugin(BasePlugin):
                 queue.append(request_id)
             self._active.pop(key, None)
             self._save_state()
-        self.core.transfers.retry_download(transfer)
+        try:
+            self.core.transfers.retry_download(transfer)
+        except Exception:
+            self._discard_request_id(key, request_id)
+            raise
         return {
             "request_id": request_id,
             "user": user,
@@ -724,14 +792,18 @@ class Plugin(BasePlugin):
 
     def _start_server(self):
         if self._server_thread and self._server_thread.is_alive():
-            return
+            return self._server_ready.is_set() and not self._server_error
         self._stop.clear()
+        self._server_ready.clear()
+        self._server_error = ""
         try:
             self.socket_path.unlink(missing_ok=True)
         except Exception:
             pass
         self._server_thread = threading.Thread(target=self._serve, name="DiscordBridgeSocket", daemon=True)
         self._server_thread.start()
+        self._server_ready.wait(2.0)
+        return self._server_ready.is_set() and not self._server_error
 
     def _start_progress_watcher(self):
         if self._progress_thread and self._progress_thread.is_alive():
@@ -743,7 +815,11 @@ class Plugin(BasePlugin):
         while not self._stop.wait(2.0):
             try:
                 self._poll_download_progress()
-            except Exception:
+            except Exception as exc:
+                now = time.monotonic()
+                if now - self._last_progress_error_log >= 60.0:
+                    self._last_progress_error_log = now
+                    self.log(f"Discord bridge progress watcher failed: {exc}")
                 continue
 
     def _poll_download_progress(self):
@@ -809,6 +885,7 @@ class Plugin(BasePlugin):
             os.chmod(self.socket_path, 0o660)
             server.listen(5)
             server.settimeout(1.0)
+            self._server_ready.set()
             while not self._stop.is_set():
                 try:
                     client, _ = server.accept()
@@ -817,6 +894,10 @@ class Plugin(BasePlugin):
                 except OSError:
                     break
                 threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
+        except Exception as exc:
+            self._server_error = str(exc)
+            self._server_ready.set()
+            self.log(f"Discord bridge socket server failed: {exc}")
         finally:
             try:
                 server.close()
@@ -827,11 +908,16 @@ class Plugin(BasePlugin):
     def _handle_client(self, client: socket.socket):
         with client:
             try:
+                client.settimeout(CLIENT_READ_TIMEOUT_SECONDS)
                 chunks = []
+                received = 0
                 while True:
                     data = client.recv(65536)
                     if not data:
                         break
+                    received += len(data)
+                    if received > MAX_REQUEST_BYTES:
+                        raise ValueError("bridge request exceeded 1 MiB")
                     chunks.append(data)
                 if not chunks:
                     return
@@ -847,8 +933,12 @@ class Plugin(BasePlugin):
     def _run_on_main_thread(self, request: dict) -> dict:
         result = {}
         done = threading.Event()
+        expired = threading.Event()
 
         def runner():
+            if expired.is_set():
+                done.set()
+                return False
             try:
                 result.update(self._handle_request(request))
             except Exception as exc:
@@ -858,7 +948,8 @@ class Plugin(BasePlugin):
             return False
 
         GLib.idle_add(runner)
-        if not done.wait(30):
+        if not done.wait(MAIN_THREAD_TIMEOUT_SECONDS):
+            expired.set()
             return {"ok": False, "error": "timeout waiting for Nicotine main loop"}
         return result
 
@@ -867,6 +958,37 @@ class Plugin(BasePlugin):
 
         if op == "ping":
             return {"ok": True, "message": "pong"}
+
+        if op == "status":
+            protothread = getattr(self.core, "protothread", None)
+            disconnected = getattr(protothread, "server_disconnected", None)
+            with self._lock:
+                active_ids = set(self._active.values())
+                pending_requests = sum(
+                    1 for values in self._pending.values() for request_id in values
+                    if request_id not in active_ids
+                )
+                active_requests = len(self._active)
+            downloads = getattr(getattr(self.core, "transfers", None), "downloads", None) or []
+            return {
+                "ok": True,
+                "message": "bridge healthy",
+                "soulseek_connected": None if disconnected is None else not bool(disconnected),
+                "pending_requests": pending_requests,
+                "active_requests": active_requests,
+                "download_transfers": len(downloads),
+                "event_log_bytes": self.events_path.stat().st_size if self.events_path.exists() else 0,
+                "uptime_seconds": max(0, int(time.monotonic() - self._started_at)),
+            }
+
+        if op == "rescan_shares":
+            shares = getattr(self.core, "shares", None)
+            if shares is None:
+                return {"ok": False, "error": "Nicotine shares core is unavailable"}
+            result = shares.rescan_shares()
+            if result:
+                return {"ok": False, "error": str(result)}
+            return {"ok": True, "message": "share rescan started"}
 
         if op == "search":
             query = str(request.get("query") or "").strip()
@@ -1065,8 +1187,6 @@ class Plugin(BasePlugin):
 
     def download_finished_notification(self, user, virtual_path, real_path):
         request_id = self._claim_request_id(user, virtual_path, finish=True)
-        if request_id is None:
-            request_id = self._claim_request_id(user, virtual_path, finish=False)
         if request_id:
             self._progress_marks.pop(request_id, None)
         if not self.settings.get("emit_download_finished", True):
