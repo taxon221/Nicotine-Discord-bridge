@@ -35,9 +35,9 @@ Open `.env` and fill in your values:
 | `DISCORD_GUILD_ID` | No | Guild (server) ID — limits slash command sync to one server |
 | `DISCORD_ALERT_CHANNEL_ID` | No | Channel ID for upload alerts |
 | `NICOTINE_BRIDGE_CONFIG` | No | Path to `runtime.json` if not in the default location |
-| `NICOTINE_BRIDGE_HOST` / `NICOTINE_BRIDGE_PORT` | No | Override the TCP address used to reach the plugin |
+| `NICOTINE_BRIDGE_SOCKET` | No | Override the local Unix socket from `runtime.json` |
 | `NICOTINE_BRIDGE_EVENTS` / `NICOTINE_BRIDGE_STATE` | No | Override event log and bot state file paths |
-| `BRIDGE_BOT_ENV` | No | Path to your `.env` file — defaults to `./.env` relative to where you run `python bot.py` |
+| `NICOTINE_BRIDGE_TIMEOUT` | No | Local bridge-call timeout in seconds (default `8`) |
 
 ### 4. Run the bot
 
@@ -51,8 +51,11 @@ Keep it running alongside Nicotine.
 ## Slash commands
 
 - `/slsk ping` — check if the bridge is alive
+- `/slsk status` — show bridge latency, Soulseek connectivity, and tracked queue health
 - `/slsk album` — search, pick a folder, queue downloads
 - `/slsk download` — queue a file by Soulseek username + path
+- `/slsk queue` — inspect bridge-tracked downloads
+- `/slsk unqueue` — remove one or several bridge-tracked downloads
 
 ## Nicotine plugin settings
 
